@@ -185,10 +185,23 @@ function renderResults(resultData) {
     } else {
         assessments.forEach(assessment => {
             const strengthsList = (assessment.strengths || []).map(s => `<li class="text-gray-700">${s}</li>`).join('');
+            
+            // --- START OF THE FIX ---
             const improvementsList = (assessment.improvements || []).map(imp => {
-                const quoteHTML = imp.quote ? `<blockquote class="mt-2 text-sm italic text-gray-500 border-l-4 border-gray-300 pl-3">"${imp.quote}"</blockquote>` : '';
-                return `<div class="border-t border-gray-200 pt-3 mt-3"><p class="text-gray-800">${imp.point}</p>${quoteHTML}</div>`;
+                let exampleHTML = '';
+                // Check if the new 'example' object exists and has content
+                if (imp.example && (imp.example.instead_of || imp.example.try_this)) {
+                    exampleHTML = `
+                        <div class="mt-2 text-sm italic text-gray-500 border-l-4 border-gray-200 pl-3 space-y-2">
+                            <p><strong class="text-gray-600">Instead of:</strong> "${imp.example.instead_of}"</p>
+                            <p><strong class="text-green-600">Try this:</strong> "${imp.example.try_this}"</p>
+                        </div>
+                    `;
+                }
+                return `<div class="border-t border-gray-200 pt-3 mt-3"><p class="text-gray-800 font-medium">${imp.point}</p>${exampleHTML}</div>`;
             }).join('');
+            // --- END OF THE FIX ---
+
             const tipsList = (assessment.coaching_tips || []).map(tip => `<li class="text-gray-700">${tip}</li>`).join('');
             const ratingColor = assessment.rating >= 4 ? 'text-green-600' : assessment.rating >= 3 ? 'text-yellow-600' : 'text-red-600';
             html += `<div class="mt-4 bg-white p-6 rounded-lg shadow-md"><div class="flex justify-between items-start mb-4"><h3 class="text-lg font-bold text-gray-900">${assessment.skill}</h3><p class="text-2xl font-bold ${ratingColor}">${assessment.rating}<span class="text-base font-medium text-gray-500">/5</span></p></div><div class="mt-4"><h4 class="font-bold text-sm text-green-700 uppercase tracking-wider pb-1 border-b-2 border-green-200">Strengths Exhibited</h4><ul class="list-disc list-inside text-sm mt-2 space-y-2">${strengthsList || '<li>None identified.</li>'}</ul></div><div class="mt-6"><h4 class="font-bold text-sm text-yellow-700 uppercase tracking-wider pb-1 border-b-2 border-yellow-200">Areas for Improvement</h4><div class="text-sm mt-2 space-y-4">${improvementsList || '<p>None identified.</p>'}</div></div><div class="mt-6"><h4 class="font-bold text-sm text-blue-700 uppercase tracking-wider pb-1 border-b-2 border-blue-200">Coaching Tips</h4><ul class="list-disc list-inside text-sm mt-2 space-y-2">${tipsList || '<li>None identified.</li>'}</ul></div></div>`;
