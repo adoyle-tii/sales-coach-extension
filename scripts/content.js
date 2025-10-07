@@ -42,8 +42,21 @@ function getTranscriptAndSpeakers() {
             const text = textEl.textContent.trim().replace(/\s+/g, ' ');
 
             if (!speakersInTranscript.has(speakerName)) {
-                const isInternal = speakerRoleMap.get(speakerName) || false;
-                speakersInTranscript.set(speakerName, { name: speakerName, isInternal: isInternal });
+                let isInternal = speakerRoleMap.get(speakerName); // Try for an exact match first.
+
+                // If the exact match fails, try a fuzzy match.
+                if (isInternal === undefined) {
+                    // Find a key in the role map (e.g., "Megan Leith Sexton") that contains the transcript name (e.g., "Megan Sexton").
+                    for (const [fullName, internalStatus] of speakerRoleMap.entries()) {
+                        if (fullName.includes(speakerName)) {
+                            isInternal = internalStatus;
+                            break; // Stop after the first match.
+                        }
+                    }
+                }
+    
+                // Default to false if no match was found.
+                speakersInTranscript.set(speakerName, { name: speakerName, isInternal: isInternal || false });
             }
 
             if (speakerName === lastSpeaker && transcriptLines.length > 0) {
