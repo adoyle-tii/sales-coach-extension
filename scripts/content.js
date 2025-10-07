@@ -33,6 +33,7 @@ function getTranscriptAndSpeakers() {
     const speakersInTranscript = new Map();
     let lastSpeaker = null;
 
+    // --- Step 1: Parse the transcript and gather all unique speakers ---
     entries.forEach(entry => {
         const speakerEl = entry.querySelector('[class*="SpeakerInfoHeader-module__speaker-info-wrapper--"] > div > span:first-child');
         const textEl = entry.querySelector('[class*="EntryText-module__entry-text--"]');
@@ -41,24 +42,9 @@ function getTranscriptAndSpeakers() {
             const speakerName = speakerEl.textContent.trim();
             const text = textEl.textContent.trim().replace(/\s+/g, ' ');
 
+            // Add speaker to the map if not already present, default isInternal to false.
             if (!speakersInTranscript.has(speakerName)) {
-                // --- START OF THE FIX ---
-                let isInternal = speakerRoleMap.get(speakerName); // 1. Try for a perfect, exact match first.
-
-                // 2. If the exact match fails, try a "fuzzy" match.
-                if (isInternal === undefined) {
-                    // Find a key in the role map (e.g., "Megan Leith Sexton") that contains the transcript name (e.g., "Megan Sexton").
-                    for (const [fullName, internalStatus] of speakerRoleMap.entries()) {
-                        if (fullName.includes(speakerName)) {
-                            isInternal = internalStatus;
-                            break; // Stop after the first successful fuzzy match.
-                        }
-                    }
-                }
-                
-                // 3. Set the speaker's status, defaulting to 'false' if no match was found.
-                speakersInTranscript.set(speakerName, { name: speakerName, isInternal: isInternal || false });
-                // --- END OF THE FIX ---
+                speakersInTranscript.set(speakerName, { name: speakerName, isInternal: false });
             }
 
             if (speakerName === lastSpeaker && transcriptLines.length > 0) {
@@ -69,6 +55,24 @@ function getTranscriptAndSpeakers() {
             }
         }
     });
+
+    // --- Step 2: Now, iterate through the unique speakers and correctly identify their roles ---
+    for (const [speakerName, speakerData] of speakersInTranscript.entries()) {
+        let isInternal = speakerRoleMap.get(speakerName); // 1. Try for a perfect, exact match first.
+
+        // 2. If the exact match fails, try a "fuzzy" match.
+        if (isInternal === undefined) {
+            for (const [fullName, internalStatus] of speakerRoleMap.entries()) {
+                if (fullName.includes(speakerName)) {
+                    isInternal = internalStatus;
+                    break; 
+                }
+            }
+        }
+        
+        // 3. Update the speaker's status in our map.
+        speakerData.isInternal = isInternal || false;
+    }
 
     return {
         transcript: transcriptLines.join('\n'),
