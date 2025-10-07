@@ -60,12 +60,19 @@ function getTranscriptAndSpeakers() {
     for (const [speakerName, speakerData] of speakersInTranscript.entries()) {
         let isInternal = speakerRoleMap.get(speakerName); // 1. Try for a perfect, exact match first.
 
-        // 2. If the exact match fails, try a "fuzzy" match.
+        // 2. If the exact match fails, try a more robust "fuzzy" match.
+        // This handles cases like "Megan Sexton" (in transcript) vs. "Megan Leith Sexton" (in scrubber).
         if (isInternal === undefined) {
+            const transcriptNameParts = speakerName.toLowerCase().split(' ');
             for (const [fullName, internalStatus] of speakerRoleMap.entries()) {
-                if (fullName.includes(speakerName)) {
+                const scrubberNameParts = fullName.toLowerCase().split(' ');
+                
+                // Check if every part of the transcript name exists in the scrubber name
+                const isMatch = transcriptNameParts.every(part => scrubberNameParts.includes(part));
+
+                if (isMatch) {
                     isInternal = internalStatus;
-                    break; 
+                    break; // Found a match, stop searching
                 }
             }
         }
