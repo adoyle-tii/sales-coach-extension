@@ -42,20 +42,21 @@ function getTranscriptAndSpeakers() {
             const text = textEl.textContent.trim().replace(/\s+/g, ' ');
 
             if (!speakersInTranscript.has(speakerName)) {
-                let isInternal = speakerRoleMap.get(speakerName); // Try for an exact match first.
+                // --- START OF THE FIX ---
+                let isInternal = speakerRoleMap.get(speakerName); // 1. Try for a perfect, exact match first.
 
-                // If the exact match fails (e.g., "Megan Sexton" vs "Megan Leith Sexton"), try a fuzzy match.
+                // 2. If the exact match fails, try a "fuzzy" match.
                 if (isInternal === undefined) {
-                    // Find a key in the role map that contains the transcript name.
+                    // Find a key in the role map (e.g., "Megan Leith Sexton") that contains the transcript name (e.g., "Megan Sexton").
                     for (const [fullName, internalStatus] of speakerRoleMap.entries()) {
                         if (fullName.includes(speakerName)) {
                             isInternal = internalStatus;
-                            break; // Stop after the first match.
+                            break; // Stop after the first successful fuzzy match.
                         }
                     }
                 }
                 
-                // Default to false if no match was found.
+                // 3. Set the speaker's status, defaulting to 'false' if no match was found.
                 speakersInTranscript.set(speakerName, { name: speakerName, isInternal: isInternal || false });
                 // --- END OF THE FIX ---
             }
