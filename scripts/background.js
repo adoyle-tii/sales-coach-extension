@@ -19,6 +19,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         handleFullAssessment(request.payload);
         return true;
     }
+    // NEW: Handle coaching request for roleplays
+    if (request.action === "startCoaching") {
+        handleCoaching(request.payload);
+        return true;
+    }
     if (request.action === "checkCacheStatus") {
         handleCacheCheck(request.payload).then(sendResponse);
         return true;
@@ -33,6 +38,45 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 // --- API CALL HANDLERS ---
+
+/**
+ * NEW: Handles the request to generate coaching feedback for a roleplay.
+ */
+async function handleCoaching({ transcript, assessedSkills }) {
+    console.log("Background script: Received coaching task for skills:", assessedSkills);
+    try {
+        await chrome.storage.local.set({
+            assessmentStatus: 'assessment-loading',
+            assessmentStep: 'Generating enhanced coaching feedback...'
+        });
+
+        const response = await fetch(`${WORKER_URL}/coach`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ transcript, skills: assessedSkills }), // Sending skills with scores
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error || `Coaching worker failed with status ${response.status}`);
+        }
+        
+        const result = await response.json();
+
+        await chrome.storage.local.set({
+            assessmentStatus: 'assessment-complete',
+            assessmentResult: result
+        });
+
+    } catch (error) {
+        console.error("Background coaching error:", error);
+        await chrome.storage.local.set({
+            assessmentStatus: 'assessment-error',
+            assessmentError: error.message || 'Unknown error'
+        });
+    }
+}
+
 
 async function handlePreAssessment({ transcript, allSkills }) {
     console.log("Background script: Received pre-assessment task.");

@@ -1,23 +1,128 @@
 /**
- * Scrapes the Highspot Meeting Intelligence page to extract the transcript
- * and differentiate between internal and external speakers.
+ * Scrapes Highspot pages to extract transcript and speaker data for either
+ * Meeting Intelligence or Roleplay Results pages.
  */
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request.action === "getTranscriptData") {
-        const data = getTranscriptAndSpeakers();
-        // Debug log of the cleaned transcript (optional)
-        console.log("--- Cleaned Transcript ---");
-        console.log(data.transcript);
+    if (request.action === "get_page_type") {
+        const pageType = detectPageType();
+        sendResponse({ type: pageType });
+        return true;
+    }
+
+    if (request.action === "get_page_data") {
+        const pageType = detectPageType();
+        let data = { type: pageType, success: false };
+
+        if (pageType === 'meeting') {
+            data = { ...data, ...getTranscriptAndSpeakers() };
+            data.success = !!data.transcript;
+        } else if (pageType === 'roleplay') {
+            data = { ...data, ...getRoleplayData() };
+            data.success = !!data.transcript && data.assessedSkills.length > 0;
+        }
         sendResponse(data);
     }
-    return true;
+    return true; // Keep the message channel open for asynchronous response
 });
+
+/**
+ * Detects whether the current page is a meeting intelligence or roleplay results page.
+ * @returns {'meeting' | 'roleplay' | 'unknown'}
+ */
+function detectPageType() {
+    const isMeeting = document.querySelector('[class*="TranscriptEntry-module__transcript-entry--"]');
+    // Use the main container for the skills list to identify a roleplay page.
+    const isRoleplay = document.querySelector('.AssessmentSkillList-module__root--lCjd4');
+
+    if (isRoleplay) return 'roleplay';
+    if (isMeeting) return 'meeting';
+    return 'unknown';
+}
+
+
+/**
+ * Scrapes the Roleplay Results page for the transcript and assessed skills.
+ * This function now uses the specific class names from your provided DOM structure.
+ * @returns {{transcript: string, assessedSkills: {skill: string, score: number}[]}}
+ */
+function getRoleplayData() {
+    // --- TRANSCRIPT SCRAPING ---
+    const transcriptLines = [];
+    const entries = document.querySelectorAll('.ViewAssessmentTranscriptEntry-module__entry--u9p1d');
+    entries.forEach(entry => {
+        const speakerEl = entry.querySelector('.ViewAssessmentTranscriptEntry-module__entry-speaker--v7wee span');
+        const speaker = speakerEl ? speakerEl.textContent.trim() : 'Unknown';
+        const textEl = entry.querySelector('.ViewAssessmentTranscriptEntry-module__entry-text--i6_cf');
+        const text = textEl ? textEl.textContent.trim() : '';
+
+        if (text) {
+            transcriptLines.push(`${speaker}: ${text}`);
+        }
+    });
+    
+    const fullTranscript = transcriptLines.join('\n');
+
+    // --- NEW: Log the scraped transcript to the console ---
+    console.log("--- Roleplay Transcript Scraped ---");
+    console.log(fullTranscript);
+    // ----------------------------------------------------
+
+
+    // --- ASSESSED SKILLS SCRAPING ---
+    const assessedSkills = [];
+    // Select each skill card container
+    const skillElements = document.querySelectorAll('.AssessmentSkillList-module__skill-card-container--JXvpA > div[data-testid="assessment-skill-card"]');
+
+    skillElements.forEach(el => {
+        const skillNameEl = el.closest('.AssessmentSkillList-module__skill-card-container--JXvpA').querySelector('.AssessmentSkillCardSummary-module__title--U7ETe');
+        const skillName = skillNameEl ? skillNameEl.textContent.trim() : null;
+
+        let score = 0;
+        // Find the score div that has the specific background/selected class
+        const scoreEl = el.querySelector('[class*="AssessmentSkillCardFeedback-module__score-"][style*="background-color"]');
+        if (scoreEl) {
+             const scoreClass = Array.from(scoreEl.classList).find(c => c.includes('__score-'));
+             if(scoreClass) {
+                score = parseInt(scoreClass.split('__score-')[1], 10);
+             }
+        }
+        
+        // Fallback for when style is not applied, get the number from the class
+        if (score === 0) {
+            const scoreValEl = el.querySelector('[class*="AssessmentSkillCardFeedback-module__score-3"]'); // Example for score 3
+            if(scoreValEl){
+                 const scoreClass = Array.from(scoreValEl.classList).find(c => c.includes('__score-'));
+                 if (scoreClass) {
+                    score = parseInt(scoreClass.split('--')[1].replace(/\D/g, ''), 10);
+                }
+            }
+        }
+
+
+        if (skillName && score > 0) {
+            assessedSkills.push({ skill: skillName, score: score });
+        }
+    });
+
+    return {
+        transcript: fullTranscript,
+        assessedSkills: assessedSkills
+    };
+}
+
+
+/* ========================================================================== */
+/* =================== EXISTING MEETING SCRAPING LOGIC ====================== */
+/* ========================================================================== */
+
+// ... (The rest of the original content.js file, including getTranscriptAndSpeakers,
+//      jaroWinkler, etc., remains unchanged here.)
 
 /* =========================
    FUZZY NAME MATCH HELPERS
    ========================= */
-const INTERNAL_MATCH_THRESHOLD = 0.78; // tuned for cases like "Pilar Hernández Aguilera" vs "Pilar Hernandez - Turnitin"
+const INTERNAL_MATCH_THRESHOLD = 0.78; 
 
 function stripDiacritics(s) {
     return String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
@@ -102,7 +207,7 @@ function nameSimilarity(a, b) {
 }
 
 /**
- * Main function to orchestrate the scraping process.
+ * Main function to orchestrate the scraping process for meetings.
  * It first identifies speaker roles from the timeline, then parses the transcript.
  * @returns {{transcript: string, speakers: {name: string, isInternal: boolean}[]}}
  */
@@ -199,4 +304,4 @@ function getSpeakerRoles() {
     return speakerRoleMap;
 }
 
-console.log("Sales Coach content script loaded and ready (v4 - fuzzy internal matching).");
+console.log("Sales Coach content script loaded and ready (v2.0.01 - roleplay scraping).");

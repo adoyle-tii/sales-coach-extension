@@ -1,4 +1,9 @@
 // --- DOM ELEMENTS ---
+const meetingFlowContainer = document.getElementById('meeting-flow-container');
+const roleplayContainer = document.getElementById('roleplay-container');
+const roleplaySkillsSummary = document.getElementById('roleplay-skills-summary');
+const generateCoachingBtn = document.getElementById('generate-coaching-btn');
+
 const step1Container = document.getElementById('step-1-container');
 const step2Container = document.getElementById('step-2-container');
 const initialLoader = document.getElementById('initial-loader-container');
@@ -10,30 +15,38 @@ const skillsSelectionContainer = document.getElementById('skills-selection-conta
 const competencySkillSelector = document.getElementById('competency-skill-selector');
 const runAssessmentBtn = document.getElementById('run-assessment-btn');
 const finalLoader = document.getElementById('final-loader-container');
-const assessmentProgressText = document.getElementById('assessment-progress-text'); 
+const assessmentProgressText = document.getElementById('assessment-progress-text');
 const resultsContainer = document.getElementById('results-container');
 const selectAllBtn = document.getElementById('select-all-btn');
 const deselectAllBtn = document.getElementById('deselect-all-btn');
 const resetBtn = document.getElementById('reset-btn');
 
 // --- GLOBAL STATE ---
+let pageType = 'unknown';
 let transcriptText = "";
 let pageSpeakers = [];
+let assessedSkills = []; // For roleplay data
 
 // --- UI STATE MANAGEMENT ---
 function showState(state) {
-    [step1Container, step2Container, initialLoader, sellerSelectionContainer, skillsLoader, skillsSelectionContainer, finalLoader, resultsContainer].forEach(el => el.classList.add('hidden'));
-    
+    const allContainers = [
+        meetingFlowContainer, roleplayContainer, step1Container, step2Container,
+        initialLoader, sellerSelectionContainer, skillsLoader,
+        skillsSelectionContainer, finalLoader, resultsContainer
+    ];
+    allContainers.forEach(el => el.classList.add('hidden'));
+
     switch (state) {
         case 'initial-loading':
-            step1Container.classList.remove('hidden');
             initialLoader.classList.remove('hidden');
             break;
-        case 'seller-selection':
+        case 'seller-selection': // Meeting flow start
+            meetingFlowContainer.classList.remove('hidden');
             step1Container.classList.remove('hidden');
             sellerSelectionContainer.classList.remove('hidden');
             break;
         case 'skills-loading':
+            meetingFlowContainer.classList.remove('hidden');
             step1Container.classList.remove('hidden');
             sellerSelectionContainer.classList.remove('hidden');
             step2Container.classList.remove('hidden');
@@ -41,10 +54,14 @@ function showState(state) {
             skillsLoader.querySelector('p').textContent = "Finding relevant skills...";
             break;
         case 'skills-selection':
+            meetingFlowContainer.classList.remove('hidden');
             step1Container.classList.remove('hidden');
             sellerSelectionContainer.classList.remove('hidden');
             step2Container.classList.remove('hidden');
             skillsSelectionContainer.classList.remove('hidden');
+            break;
+        case 'roleplay-selection': // Roleplay flow start
+            roleplayContainer.classList.remove('hidden');
             break;
         case 'assessment-loading':
             finalLoader.classList.remove('hidden');
@@ -53,29 +70,27 @@ function showState(state) {
             resultsContainer.classList.remove('hidden');
             break;
         case 'error':
-             resultsContainer.classList.remove('hidden');
+            resultsContainer.classList.remove('hidden');
             break;
     }
 }
 
+
 // --- DATA & STATE FUNCTIONS ---
 function saveState() {
-    const selectedSeller = sellerSelect.value;
-    const selectedSkills = Array.from(document.querySelectorAll('input[name="skill"]:checked')).map(cb => cb.id);
-    const openCompetencies = Array.from(document.querySelectorAll('details[open] summary .competency-name')).map(s => s.textContent.trim());
-    chrome.storage.local.set({ selectedSeller, selectedSkills, openCompetencies });
+    // Only save state for the meeting flow
+    if (pageType === 'meeting') {
+        const selectedSeller = sellerSelect.value;
+        const selectedSkills = Array.from(document.querySelectorAll('input[name="skill"]:checked')).map(cb => cb.id);
+        const openCompetencies = Array.from(document.querySelectorAll('details[open] summary .competency-name')).map(s => s.textContent.trim());
+        chrome.storage.local.set({ selectedSeller, selectedSkills, openCompetencies });
+    }
 }
 
 async function loadAndApplyState() {
   const data = await chrome.storage.local.get([
-    'assessmentStatus',
-    'assessmentStep',
-    'assessmentResult',
-    'assessmentError',
-    'selectedSeller',
-    'relevantSkills',
-    'selectedSkills',
-    'openCompetencies'
+    'assessmentStatus', 'assessmentStep', 'assessmentResult', 'assessmentError',
+    'selectedSeller', 'relevantSkills', 'selectedSkills', 'openCompetencies'
   ]);
 
   if (data.assessmentStatus === 'assessment-complete' && data.assessmentResult) {
@@ -83,11 +98,10 @@ async function loadAndApplyState() {
     logAssessmentDetails(data.assessmentResult, "Loaded from storage");
     showState('results');
   } else if (data.assessmentStatus === 'assessment-loading') {
-    assessmentProgressText.textContent = data.assessmentStep || "Running full assessment...";
+    assessmentProgressText.textContent = data.assessmentStep || "Running assessment...";
     showState('assessment-loading');
-  } else if (data.assessmentStatus === 'skills-loading') {
-    showState('skills-loading');
-  } else if (data.assessmentStatus === 'skills-selection' && data.relevantSkills) {
+  } else if (pageType === 'meeting' && data.assessmentStatus === 'skills-selection' && data.relevantSkills) {
+    // This part is specific to the meeting flow
     await checkCachedAssessments(data.relevantSkills);
   } else if (data.assessmentStatus === 'assessment-error') {
     resultsContainer.innerHTML = `
@@ -97,22 +111,30 @@ async function loadAndApplyState() {
       </div>`;
     showState('error');
   } else {
-    showState('seller-selection');
-    if (data.selectedSeller) sellerSelect.value = data.selectedSeller;
+    // Default view for the detected page type
+    if (pageType === 'meeting') {
+        showState('seller-selection');
+        if (data.selectedSeller) sellerSelect.value = data.selectedSeller;
+    } else if (pageType === 'roleplay') {
+        showState('roleplay-selection');
+    }
   }
 }
-
 
 function resetState() {
     chrome.runtime.sendMessage({ action: "clearState" }, () => {
         console.log("State cleared.");
+        // Clear UI elements
         sellerSelect.innerHTML = '';
         competencySkillSelector.innerHTML = '';
         resultsContainer.innerHTML = '';
+        roleplaySkillsSummary.innerHTML = '';
+        // Re-initialize
         initializePopup();
     });
 }
 
+// ... (logAssessmentDetails function remains the same)
 function logAssessmentDetails(data, source = "New fetch") {
     const meta = data?.meta || {};
     const timing = meta.timing || {};
@@ -131,6 +153,7 @@ function logAssessmentDetails(data, source = "New fetch") {
 
 
 // --- DYNAMIC UI RENDERING ---
+// ... (renderSkillSelector and renderResults functions remain the same)
 function renderSkillSelector(relevantSkills = [], cachedStatus = {}) {
     competencySkillSelector.innerHTML = '';
     const fragment = document.createDocumentFragment();
@@ -204,8 +227,6 @@ function renderResults(resultData) {
         assessments.forEach(assessment => {
             const strengthsList = (assessment.strengths || []).map(s => `<li class="text-gray-700">${s}</li>`).join('');
             
-            // --- START OF THE FIX ---
-            // This new mapping correctly handles the nested 'example' object.
             const improvementsList = (assessment.improvements || []).map(imp => {
                 let exampleHTML = '';
                 if (imp.example && (imp.example.instead_of || imp.example.try_this)) {
@@ -218,7 +239,6 @@ function renderResults(resultData) {
                 }
                 return `<div class="border-t border-gray-200 pt-3 mt-3"><p class="text-gray-800 font-medium">${imp.point}</p>${exampleHTML}</div>`;
             }).join('');
-            // --- END OF THE FIX ---
 
             const tipsList = (assessment.coaching_tips || []).map(tip => `<li class="text-gray-700">${tip}</li>`).join('');
             const ratingColor = assessment.rating >= 4 ? 'text-green-600' : assessment.rating >= 3 ? 'text-yellow-600' : 'text-red-600';
@@ -248,6 +268,7 @@ function renderResults(resultData) {
 }
 
 // --- EVENT HANDLERS & LOGIC ---
+// ... (handleSelectionChange, updateCompetencyCheckboxes, selectAllSkills, handleAnalyzeSkills, handleRunAssessment, checkCachedAssessments remain mostly the same, but now are part of the meeting flow)
 function handleSelectionChange(e) {
     const target = e.target;
     if (target.matches('.competency-checkbox')) {
@@ -295,32 +316,30 @@ async function handleRunAssessment() {
   
   showState('assessment-loading');
 
-  const selectedRubrics = {};
-  const checkedBoxes = Array.from(document.querySelectorAll('input[name="skill"]:checked'));
-  checkedBoxes.forEach(cb => {
-    const [competency, skill] = cb.id.split('|');
-    if (ALL_RUBRICS[competency] && ALL_RUBRICS[competency].skills[skill]) {
-      if (!selectedRubrics[competency]) {
-        selectedRubrics[competency] = { skills: {} };
-      }
-      selectedRubrics[competency].skills[skill] = ALL_RUBRICS[competency].skills[skill];
-    }
-  });
-
-  const internalSpeakers = pageSpeakers
-    .filter(s => s && s.isInternal)
-    .map(s => s.name)
-    .filter(Boolean);
-
   chrome.runtime.sendMessage({
     action: "startFullAssessment",
     payload: {
       transcript: transcriptText,
       sellerId: selectedSeller,
       skills: selectedSkills,
-      internalSpeakers // <-- use the global-derived list
     }
   });
+}
+
+
+/**
+ * NEW: Event handler for the roleplay coaching button.
+ */
+function handleGenerateCoaching() {
+    showState('assessment-loading');
+    assessmentProgressText.textContent = "Generating enhanced coaching...";
+    chrome.runtime.sendMessage({
+        action: "startCoaching",
+        payload: {
+            transcript: transcriptText,
+            assessedSkills: assessedSkills // Send the scraped skills and scores
+        }
+    });
 }
 
 async function checkCachedAssessments(relevantSkills) {
@@ -338,7 +357,6 @@ async function checkCachedAssessments(relevantSkills) {
     });
 
     console.log("Received cache status from worker:", cachedStatus);
-    // ------------------------------------
 
     renderSkillSelector(relevantSkills, cachedStatus);
     showState('skills-selection');
@@ -360,7 +378,7 @@ async function checkCachedAssessments(relevantSkills) {
     updateCompetencyCheckboxes();
 }
 
-function getTranscriptWithRetries(retries = 5, delay = 500) {
+function getPageDataWithRetries(retries = 5, delay = 500) {
     return new Promise((resolve, reject) => {
         const attempt = (n) => {
             chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -369,11 +387,11 @@ function getTranscriptWithRetries(retries = 5, delay = 500) {
                    else reject(new Error("Could not find active tab."));
                    return;
                 }
-                chrome.tabs.sendMessage(tabs[0].id, { action: "getTranscriptData" }, (response) => {
-                    if (chrome.runtime.lastError || !response || !response.transcript) {
-                        console.log(`Attempt ${6-n}: Transcript not found, retrying...`);
+                chrome.tabs.sendMessage(tabs[0].id, { action: "get_page_data" }, (response) => {
+                    if (chrome.runtime.lastError || !response || !response.success) {
+                        console.warn(`Attempt ${6-n}: Page data not found, retrying...`);
                         if (n > 0) setTimeout(() => attempt(n - 1), delay);
-                        else reject(new Error("Failed to get transcript from page. Ensure a Highspot page is open and fully loaded."));
+                        else reject(new Error("Failed to get required data from the page. Please ensure a valid Highspot page is open and fully loaded."));
                     } else {
                         resolve(response);
                     }
@@ -384,24 +402,42 @@ function getTranscriptWithRetries(retries = 5, delay = 500) {
     });
 }
 
+
 async function initializePopup() {
     showState('initial-loading');
     try {
-        const response = await getTranscriptWithRetries();
-        
+        const response = await getPageDataWithRetries();
+        pageType = response.type;
         transcriptText = response.transcript;
-        pageSpeakers = Array.isArray(response.speakers) ? response.speakers : [];
-        console.log("--- Cleaned Transcript from content.js ---");
-        console.log(transcriptText);
 
-        const internalSpeakers = response.speakers.filter(s => s.isInternal);
-        if (internalSpeakers.length > 0) {
-            sellerSelect.innerHTML = internalSpeakers.map(speaker => `<option value="${speaker.name}">${speaker.name}</option>`).join('');
-            analyzeSkillsBtn.disabled = false;
+        if (pageType === 'meeting') {
+            pageSpeakers = Array.isArray(response.speakers) ? response.speakers : [];
+            const internalSpeakers = response.speakers.filter(s => s.isInternal);
+            if (internalSpeakers.length > 0) {
+                sellerSelect.innerHTML = internalSpeakers.map(speaker => `<option value="${speaker.name}">${speaker.name}</option>`).join('');
+                analyzeSkillsBtn.disabled = false;
+            } else {
+                sellerSelect.innerHTML = '<option value="">No internal speakers identified</option>';
+                analyzeSkillsBtn.disabled = true;
+            }
+        } else if (pageType === 'roleplay') {
+            assessedSkills = response.assessedSkills || [];
+            if (assessedSkills.length > 0) {
+                // Display the skills found
+                roleplaySkillsSummary.innerHTML = `
+                    <p class="font-medium text-gray-700">Found ${assessedSkills.length} assessed skill(s):</p>
+                    <ul class="list-disc list-inside text-gray-600">
+                        ${assessedSkills.map(s => `<li>${s.skill} (Score: ${s.score}/5)</li>`).join('')}
+                    </ul>`;
+                generateCoachingBtn.disabled = false;
+            } else {
+                 roleplaySkillsSummary.innerHTML = `<p class="text-red-600">No assessed skills were found on this page.</p>`;
+                 generateCoachingBtn.disabled = true;
+            }
         } else {
-            sellerSelect.innerHTML = '<option value="">No internal speakers identified</option>';
-            analyzeSkillsBtn.disabled = true;
+            throw new Error("This page is not a supported Highspot Meeting or Roleplay page.");
         }
+
         await loadAndApplyState();
 
     } catch (error) {
@@ -415,15 +451,22 @@ async function initializePopup() {
 
 // --- INITIALIZATION ---
 document.addEventListener('DOMContentLoaded', () => {
+    // Meeting flow listeners
     runAssessmentBtn.addEventListener('click', handleRunAssessment);
     analyzeSkillsBtn.addEventListener('click', handleAnalyzeSkills);
     competencySkillSelector.addEventListener('change', handleSelectionChange);
     sellerSelect.addEventListener('change', saveState);
     selectAllBtn.addEventListener('click', () => selectAllSkills(true));
     deselectAllBtn.addEventListener('click', () => selectAllSkills(false));
-    resetBtn.addEventListener('click', resetState);
     competencySkillSelector.addEventListener('toggle', saveState, true);
 
+    // Roleplay flow listener
+    generateCoachingBtn.addEventListener('click', handleGenerateCoaching);
+
+    // Global listener
+    resetBtn.addEventListener('click', resetState);
+
+    // Listener for changes from background script
     chrome.storage.onChanged.addListener((changes, area) => {
         if (area !== 'local') return;
 
