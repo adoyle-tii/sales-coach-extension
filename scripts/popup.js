@@ -18,6 +18,7 @@ const resetBtn = document.getElementById('reset-btn');
 
 // --- GLOBAL STATE ---
 let transcriptText = "";
+let pageSpeakers = [];
 
 // --- UI STATE MANAGEMENT ---
 function showState(state) {
@@ -66,27 +67,41 @@ function saveState() {
 }
 
 async function loadAndApplyState() {
-    const data = await chrome.storage.local.get(['assessmentStatus', 'assessmentStep', 'lastResult', 'lastError', 'selectedSeller', 'relevantSkills', 'selectedSkills', 'openCompetencies']);
+  const data = await chrome.storage.local.get([
+    'assessmentStatus',
+    'assessmentStep',
+    'assessmentResult',
+    'assessmentError',
+    'selectedSeller',
+    'relevantSkills',
+    'selectedSkills',
+    'openCompetencies'
+  ]);
 
-    if (data.assessmentStatus === 'complete' && data.lastResult) {
-        renderResults(data.lastResult);
-        logAssessmentDetails(data.lastResult, "Loaded from storage");
-        showState('results');
-    } else if (data.assessmentStatus === 'assessment-loading') {
-        assessmentProgressText.textContent = data.assessmentStep || "Running full assessment...";
-        showState('assessment-loading');
-    } else if (data.assessmentStatus === 'skills-loading') {
-        showState('skills-loading');
-    } else if (data.assessmentStatus === 'skills-selection' && data.relevantSkills) {
-        await checkCachedAssessments(data.relevantSkills);
-    } else if (data.assessmentStatus === 'error') {
-        resultsContainer.innerHTML = `<div class="p-4 bg-red-50 text-red-700 rounded-md"><p class="font-bold">An Error Occurred:</p><p class="text-sm">${data.lastError || 'Unknown error'}</p></div>`;
-        showState('error');
-    } else {
-        showState('seller-selection');
-        if (data.selectedSeller) sellerSelect.value = data.selectedSeller;
-    }
+  if (data.assessmentStatus === 'assessment-complete' && data.assessmentResult) {
+    renderResults(data.assessmentResult);
+    logAssessmentDetails(data.assessmentResult, "Loaded from storage");
+    showState('results');
+  } else if (data.assessmentStatus === 'assessment-loading') {
+    assessmentProgressText.textContent = data.assessmentStep || "Running full assessment...";
+    showState('assessment-loading');
+  } else if (data.assessmentStatus === 'skills-loading') {
+    showState('skills-loading');
+  } else if (data.assessmentStatus === 'skills-selection' && data.relevantSkills) {
+    await checkCachedAssessments(data.relevantSkills);
+  } else if (data.assessmentStatus === 'assessment-error') {
+    resultsContainer.innerHTML = `
+      <div class="p-4 bg-red-50 text-red-700 rounded-md">
+        <p class="font-bold">An Error Occurred:</p>
+        <p class="text-sm">${data.assessmentError || 'Unknown error'}</p>
+      </div>`;
+    showState('error');
+  } else {
+    showState('seller-selection');
+    if (data.selectedSeller) sellerSelect.value = data.selectedSeller;
+  }
 }
+
 
 function resetState() {
     chrome.runtime.sendMessage({ action: "clearState" }, () => {
@@ -155,6 +170,7 @@ function renderSkillSelector(relevantSkills = [], cachedStatus = {}) {
                 ${Object.keys(relevantCompetencies[competency].skills).map(skill => {
                     const skillId = `${competency}|${skill}`;
                     const isCached = cachedStatus[skill];
+                    console.log(`[Cache Check] Skill: '${skill}', Is Cached: ${isCached}`);
                     return `
                     <div class="flex items-center justify-between">
                         <div class="flex items-center">
@@ -272,29 +288,39 @@ async function handleAnalyzeSkills() {
 }
 
 async function handleRunAssessment() {
-    const selectedSeller = sellerSelect.value;
-    const selectedSkills = Array.from(document.querySelectorAll('input[name="skill"]:checked')).map(cb => cb.id.split('|')[1]);
-    if (!selectedSeller) { alert("Please select a seller to assess."); return; }
-    if (selectedSkills.length === 0) { alert("Please select at least one skill to assess."); return; }
-    
-    showState('assessment-loading');
+  const selectedSeller = sellerSelect.value;
+  const selectedSkills = Array.from(document.querySelectorAll('input[name="skill"]:checked')).map(cb => cb.id.split('|')[1]);
+  if (!selectedSeller) { alert("Please select a seller to assess."); return; }
+  if (selectedSkills.length === 0) { alert("Please select at least one skill to assess."); return; }
+  
+  showState('assessment-loading');
 
-    const selectedRubrics = {};
-    const checkedBoxes = Array.from(document.querySelectorAll('input[name="skill"]:checked'));
-    checkedBoxes.forEach(cb => {
-        const [competency, skill] = cb.id.split('|');
-        if (ALL_RUBRICS[competency] && ALL_RUBRICS[competency].skills[skill]) {
-            if (!selectedRubrics[competency]) {
-                selectedRubrics[competency] = { skills: {} };
-            }
-            selectedRubrics[competency].skills[skill] = ALL_RUBRICS[competency].skills[skill];
-        }
-    });
+  const selectedRubrics = {};
+  const checkedBoxes = Array.from(document.querySelectorAll('input[name="skill"]:checked'));
+  checkedBoxes.forEach(cb => {
+    const [competency, skill] = cb.id.split('|');
+    if (ALL_RUBRICS[competency] && ALL_RUBRICS[competency].skills[skill]) {
+      if (!selectedRubrics[competency]) {
+        selectedRubrics[competency] = { skills: {} };
+      }
+      selectedRubrics[competency].skills[skill] = ALL_RUBRICS[competency].skills[skill];
+    }
+  });
 
-    chrome.runtime.sendMessage({
-        action: "startFullAssessment",
-        payload: { transcript: transcriptText, sellerId: selectedSeller, skills: selectedSkills }
-    });
+  const internalSpeakers = pageSpeakers
+    .filter(s => s && s.isInternal)
+    .map(s => s.name)
+    .filter(Boolean);
+
+  chrome.runtime.sendMessage({
+    action: "startFullAssessment",
+    payload: {
+      transcript: transcriptText,
+      sellerId: selectedSeller,
+      skills: selectedSkills,
+      internalSpeakers // <-- use the global-derived list
+    }
+  });
 }
 
 async function checkCachedAssessments(relevantSkills) {
@@ -310,6 +336,9 @@ async function checkCachedAssessments(relevantSkills) {
             resolve(response || {});
         });
     });
+
+    console.log("Received cache status from worker:", cachedStatus);
+    // ------------------------------------
 
     renderSkillSelector(relevantSkills, cachedStatus);
     showState('skills-selection');
@@ -361,6 +390,7 @@ async function initializePopup() {
         const response = await getTranscriptWithRetries();
         
         transcriptText = response.transcript;
+        pageSpeakers = Array.isArray(response.speakers) ? response.speakers : [];
         console.log("--- Cleaned Transcript from content.js ---");
         console.log(transcriptText);
 
@@ -395,7 +425,13 @@ document.addEventListener('DOMContentLoaded', () => {
     competencySkillSelector.addEventListener('toggle', saveState, true);
 
     chrome.storage.onChanged.addListener((changes, area) => {
-        if (area === 'local' && (changes.assessmentStatus || changes.lastResult || changes.assessmentStep)) {
+        if (area !== 'local') return;
+
+        if (changes.assessmentStep && changes.assessmentStep.newValue) {
+            assessmentProgressText.textContent = changes.assessmentStep.newValue;
+        }
+
+        if (changes.assessmentStatus || changes.assessmentResult || changes.assessmentError) {
             loadAndApplyState();
         }
     });

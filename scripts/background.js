@@ -75,52 +75,65 @@ async function handlePreAssessment({ transcript, allSkills }) {
 }
 
 async function handleFullAssessment({ transcript, sellerId, skills }) {
-    console.log("Background script: Received full assessment task for skills:", skills);
-    const requestUrl = `${WORKER_URL}/?rubric_set=${encodeURIComponent(RUBRIC_KEY)}`;
+  console.log("Background script: Received full assessment task for skills:", skills);
+  const requestUrl =
+    `${WORKER_URL}/assess?rubric_set=${encodeURIComponent(RUBRIC_KEY)}`;
 
-    try {
-        await chrome.storage.local.set({ assessmentStatus: 'assessment-loading', assessmentStep: 'Step 1/3: Indexing transcript...'});
-        const payload = {
-            transcript,
-            sellerId,
-            skills
-        };
+  try {
+    await chrome.storage.local.set({
+      assessmentStatus: 'assessment-loading',
+      assessmentStep: 'Step 1/3: Indexing transcript...'
+    });
 
-        const response = await fetch(requestUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-        
-        // This is a rough simulation, a true streaming response would be better
-        await chrome.storage.local.set({ assessmentStep: 'Step 2/3: Assessing skills...'});
+    const payload = {
+        transcript,
+        skills,
+        seller_identity: sellerId,
+        speaker_whitelist: [sellerId],
+        seller: sellerId,
+        sellerId
+    };
 
+    const res = await fetch(requestUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }).catch(err => {
+      throw new Error(`Network error: ${err?.message || String(err)}`);
+    });
 
-        if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(errorData.error || `Full assessment worker failed with status ${response.status}`);
-        }
-        
-        await chrome.storage.local.set({ assessmentStep: 'Step 3/3: Generating coaching feedback...'});
-        const resultData = await response.json();
+    await chrome.storage.local.set({ assessmentStep: 'Step 2/3: Assessing skills...' });
 
-        chrome.notifications.create({
-            type: 'basic',
-            iconUrl: '../images/icon48.png',
-            title: 'Assessment Complete',
-            message: `Your sales coaching assessment for ${resultData.seller_identity || 'the seller'} is ready.`,
-            priority: 2
-        });
-
-        await chrome.storage.local.set({
-            assessmentStatus: 'complete',
-            lastResult: resultData
-        });
-
-    } catch (error) {
-        console.error("Background full assessment error:", error);
-        await chrome.storage.local.set({ assessmentStatus: 'error', lastError: error.message });
+    if (!res.ok) {
+      let errText = '';
+      try { errText = (await res.json())?.error ?? ''; } catch { /* ignore */ }
+      if (!errText) { try { errText = await res.text(); } catch { /* ignore */ } }
+      throw new Error(errText || `Worker responded with ${res.status}`);
     }
+
+    await chrome.storage.local.set({ assessmentStep: 'Step 3/3: Generating coaching feedback...' });
+
+    const result = await res.json();
+
+    await chrome.storage.local.set({
+      assessmentStatus: 'assessment-complete',
+      assessmentResult: result
+    });
+
+    // Optional; guarded so it never throws if popup isn’t open
+    try { chrome.runtime.sendMessage({ type: 'assessment-complete' }, () => void chrome.runtime.lastError); } catch (_) {}
+
+    console.log("Background script: Assessment complete.");
+  } catch (err) {
+    console.error("Background script: Full assessment failed:", err);
+    await chrome.storage.local.set({
+      assessmentStatus: 'assessment-error',
+      assessmentError: err?.message || 'Unknown error'
+    });
+    try { chrome.runtime.sendMessage({ type: 'assessment-error' }, () => void chrome.runtime.lastError); } catch (_) {}
+  }
 }
 
 async function handleCacheCheck({ transcript, sellerId, skills }) {
