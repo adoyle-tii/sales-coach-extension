@@ -31,12 +31,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
  * @returns {'meeting' | 'roleplay' | 'unknown'}
  */
 function detectPageType() {
-    const isMeeting = document.querySelector('[class*="TranscriptEntry-module__transcript-entry--"]');
-    // Use the main container for the skills list to identify a roleplay page.
-    const isRoleplay = document.querySelector('.AssessmentSkillList-module__root--lCjd4');
+    const meetingCandidate = selectOneWithFallback({
+        testId: 'transcript-entry',
+        classPrefix: 'TranscriptEntry-module__transcript-entry'
+    });
 
-    if (isRoleplay) return 'roleplay';
-    if (isMeeting) return 'meeting';
+    // Use more resilient selectors that match the stable prefix emitted by CSS modules.
+    const roleplayCandidate = selectOneWithFallback({
+        testId: 'assessment-skill-card',
+        classPrefix: 'AssessmentSkillList-module__root'
+    });
+
+    if (roleplayCandidate) return 'roleplay';
+    if (meetingCandidate) return 'meeting';
     return 'unknown';
 }
 
@@ -49,11 +56,22 @@ function detectPageType() {
 function getRoleplayData() {
     // --- TRANSCRIPT SCRAPING ---
     const transcriptLines = [];
-    const entries = document.querySelectorAll('.ViewAssessmentTranscriptEntry-module__entry--u9p1d');
+    const entries = selectAllWithFallback({
+        testId: 'assessment-transcript-entry',
+        classPrefix: 'ViewAssessmentTranscriptEntry-module__entry'
+    });
     entries.forEach(entry => {
-        const speakerEl = entry.querySelector('.ViewAssessmentTranscriptEntry-module__entry-speaker--v7wee span');
+        const speakerEl = selectOneWithFallback({
+            root: entry,
+            testId: 'assessment-transcript-entry-speaker',
+            classPrefix: 'ViewAssessmentTranscriptEntry-module__entry-speaker'
+        })?.querySelector('span');
         const speaker = speakerEl ? speakerEl.textContent.trim() : 'Unknown';
-        const textEl = entry.querySelector('.ViewAssessmentTranscriptEntry-module__entry-text--i6_cf');
+        const textEl = selectOneWithFallback({
+            root: entry,
+            testId: 'assessment-transcript-entry-text',
+            classPrefix: 'ViewAssessmentTranscriptEntry-module__entry-text'
+        });
         const text = textEl ? textEl.textContent.trim() : '';
 
         if (text) {
@@ -64,37 +82,70 @@ function getRoleplayData() {
     const fullTranscript = transcriptLines.join('\n');
 
     // --- NEW: Log the scraped transcript to the console ---
-    console.log("--- Roleplay Transcript Scraped ---");
-    console.log(fullTranscript);
+    console.debug('[Sales Coach Extension] Roleplay transcript scraped', fullTranscript);
     // ----------------------------------------------------
 
 
     // --- ASSESSED SKILLS SCRAPING ---
     const assessedSkills = [];
     // Select each skill card container
-    const skillElements = document.querySelectorAll('.AssessmentSkillList-module__skill-card-container--JXvpA > div[data-testid="assessment-skill-card"]');
+    const skillContainers = selectAllWithFallback({
+        testId: 'assessment-skill-card-container',
+        classPrefix: 'AssessmentSkillList-module__skill-card-container'
+    });
+
+    const skillElements = [];
+    skillContainers.forEach(container => {
+        const card = selectOneWithFallback({
+            root: container,
+            testId: 'assessment-skill-card'
+        });
+        if (card) {
+            skillElements.push(card);
+        }
+    });
 
     skillElements.forEach(el => {
-        const skillNameEl = el.closest('.AssessmentSkillList-module__skill-card-container--JXvpA').querySelector('.AssessmentSkillCardSummary-module__title--U7ETe');
+        const container = el.closest('[data-testid="assessment-skill-card-container"]')
+            || el.closest('[class*="AssessmentSkillList-module__skill-card-container"]');
+        const skillNameEl = container ? selectOneWithFallback({
+            root: container,
+            testId: 'assessment-skill-card-title',
+            classPrefix: 'AssessmentSkillCardSummary-module__title'
+        }) : null;
         const skillName = skillNameEl ? skillNameEl.textContent.trim() : null;
 
         let score = 0;
         // Find the score div that has the specific background/selected class
-        const scoreEl = el.querySelector('[class*="AssessmentSkillCardFeedback-module__score-"][style*="background-color"]');
+        const scoreEl = selectOneWithFallback({
+            root: el,
+            classPrefix: 'AssessmentSkillCardFeedback-module__score-',
+            attributeFilter: el => el.matches('[style*="background-color"]')
+        });
         if (scoreEl) {
-             const scoreClass = Array.from(scoreEl.classList).find(c => c.includes('__score-'));
-             if(scoreClass) {
-                score = parseInt(scoreClass.split('__score-')[1], 10);
-             }
+            const scoreClass = Array.from(scoreEl.classList).find(c => /__score-\d+/.test(c));
+            if (scoreClass) {
+                const match = scoreClass.match(/__score-(\d+)/);
+                if (match) {
+                    score = parseInt(match[1], 10);
+                }
+            }
         }
-        
+
         // Fallback for when style is not applied, get the number from the class
         if (score === 0) {
-            const scoreValEl = el.querySelector('[class*="AssessmentSkillCardFeedback-module__score-3"]'); // Example for score 3
-            if(scoreValEl){
-                 const scoreClass = Array.from(scoreValEl.classList).find(c => c.includes('__score-'));
-                 if (scoreClass) {
-                    score = parseInt(scoreClass.split('--')[1].replace(/\D/g, ''), 10);
+            const scoreValEl = selectOneWithFallback({
+                root: el,
+                testId: 'assessment-skill-card-score',
+                classPrefix: 'AssessmentSkillCardFeedback-module__score-'
+            });
+            if (scoreValEl) {
+                const scoreClass = Array.from(scoreValEl.classList).find(c => /__score-\d+/.test(c));
+                if (scoreClass) {
+                    const match = scoreClass.match(/__score-(\d+)/);
+                    if (match) {
+                        score = parseInt(match[1], 10);
+                    }
                 }
             }
         }
@@ -109,6 +160,47 @@ function getRoleplayData() {
         transcript: fullTranscript,
         assessedSkills: assessedSkills
     };
+}
+
+function selectOneWithFallback({ root = document, testId, classPrefix, attributeFilter }) {
+    if (testId) {
+        const byTestId = root.querySelector(`[data-testid="${testId}"]`);
+        if (byTestId) {
+            if (!attributeFilter || attributeFilter(byTestId)) {
+                return byTestId;
+            }
+        }
+    }
+
+    if (classPrefix) {
+        const selector = `[class*="${classPrefix}"]`;
+        const candidates = root.querySelectorAll(selector);
+        for (const candidate of candidates) {
+            if (!attributeFilter || attributeFilter(candidate)) {
+                return candidate;
+            }
+        }
+    }
+
+    return null;
+}
+
+function selectAllWithFallback({ root = document, testId, classPrefix }) {
+    if (testId) {
+        const nodes = root.querySelectorAll(`[data-testid="${testId}"]`);
+        if (nodes.length) {
+            return Array.from(nodes);
+        }
+    }
+
+    if (classPrefix) {
+        const nodes = root.querySelectorAll(`[class*="${classPrefix}"]`);
+        if (nodes.length) {
+            return Array.from(nodes);
+        }
+    }
+
+    return [];
 }
 
 
