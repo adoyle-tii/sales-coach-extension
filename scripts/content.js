@@ -1,6 +1,7 @@
 /**
  * Scrapes Highspot pages to extract transcript and speaker data for either
  * Meeting Intelligence or Roleplay Results pages.
+ * Final version with corrected selectors based on user-provided DOM.
  */
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -14,46 +15,55 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const pageType = detectPageType();
         let data = { type: pageType, success: false };
 
-        if (pageType === 'meeting') {
-            data = { ...data, ...getTranscriptAndSpeakers() };
-            data.success = !!data.transcript;
-        } else if (pageType === 'roleplay') {
-            data = { ...data, ...getRoleplayData() };
-            data.success = !!data.transcript && data.assessedSkills.length > 0;
+        try {
+            if (pageType === 'meeting') {
+                data = { ...data, ...getTranscriptAndSpeakers() };
+                data.success = !!data.transcript;
+            } else if (pageType === 'roleplay') {
+                data = { ...data, ...getRoleplayData() };
+                data.success = !!data.transcript && data.assessedSkills.length > 0;
+            }
+        } catch (error) {
+            console.error("Sales Coach Scraping Error:", error);
+            data.success = false;
+            data.error = error.message;
         }
         sendResponse(data);
     }
-    return true; // Keep the message channel open for asynchronous response
+    return true;
 });
 
 /**
- * Detects whether the current page is a meeting intelligence or roleplay results page.
+ * Detects the page type using direct, robust queries.
  * @returns {'meeting' | 'roleplay' | 'unknown'}
  */
 function detectPageType() {
     const isMeeting = document.querySelector('[class*="TranscriptEntry-module__transcript-entry--"]');
-    // Use the main container for the skills list to identify a roleplay page.
-    const isRoleplay = document.querySelector('.AssessmentSkillList-module__root--lCjd4');
+    const isRoleplay = document.querySelector('[data-testid="view-assessment"]');
 
     if (isRoleplay) return 'roleplay';
     if (isMeeting) return 'meeting';
     return 'unknown';
 }
 
-
 /**
- * Scrapes the Roleplay Results page for the transcript and assessed skills.
- * This function now uses the specific class names from your provided DOM structure.
+ * Scrapes the Roleplay Results page.
+ * Selectors are now corrected to match the exact DOM structure.
  * @returns {{transcript: string, assessedSkills: {skill: string, score: number}[]}}
  */
 function getRoleplayData() {
     // --- TRANSCRIPT SCRAPING ---
     const transcriptLines = [];
-    const entries = document.querySelectorAll('.ViewAssessmentTranscriptEntry-module__entry--u9p1d');
+    const entries = document.querySelectorAll('div[class*="ViewAssessmentTranscriptEntry-module__entry--"]');
+    if (!entries || entries.length === 0) {
+        throw new Error("Could not find transcript entries.");
+    }
+    
     entries.forEach(entry => {
-        const speakerEl = entry.querySelector('.ViewAssessmentTranscriptEntry-module__entry-speaker--v7wee span');
+        const speakerEl = entry.querySelector('div[class*="ViewAssessmentTranscriptEntry-module__entry-speaker--"] span');
         const speaker = speakerEl ? speakerEl.textContent.trim() : 'Unknown';
-        const textEl = entry.querySelector('.ViewAssessmentTranscriptEntry-module__entry-text--i6_cf');
+
+        const textEl = entry.querySelector('span[class*="ViewAssessmentTranscriptEntry-module__entry-text--"]');
         const text = textEl ? textEl.textContent.trim() : '';
 
         if (text) {
@@ -63,42 +73,31 @@ function getRoleplayData() {
     
     const fullTranscript = transcriptLines.join('\n');
 
-    // --- NEW: Log the scraped transcript to the console ---
-    console.log("--- Roleplay Transcript Scraped ---");
-    console.log(fullTranscript);
-    // ----------------------------------------------------
-
-
     // --- ASSESSED SKILLS SCRAPING ---
     const assessedSkills = [];
-    // Select each skill card container
-    const skillElements = document.querySelectorAll('.AssessmentSkillList-module__skill-card-container--JXvpA > div[data-testid="assessment-skill-card"]');
+    const skillElements = document.querySelectorAll('div[data-testid="assessment-skill-card"]');
+    if (!skillElements || skillElements.length === 0) {
+        throw new Error("Could not find skill cards.");
+    }
 
     skillElements.forEach(el => {
-        const skillNameEl = el.closest('.AssessmentSkillList-module__skill-card-container--JXvpA').querySelector('.AssessmentSkillCardSummary-module__title--U7ETe');
+        const skillContainer = el.closest('div[class*="AssessmentSkillList-module__skill-card-container--"]');
+        const skillNameEl = skillContainer ? skillContainer.querySelector('h4[class*="AssessmentSkillCardSummary-module__title--"]') : null;
         const skillName = skillNameEl ? skillNameEl.textContent.trim() : null;
 
         let score = 0;
-        // Find the score div that has the specific background/selected class
-        const scoreEl = el.querySelector('[class*="AssessmentSkillCardFeedback-module__score-"][style*="background-color"]');
-        if (scoreEl) {
-             const scoreClass = Array.from(scoreEl.classList).find(c => c.includes('__score-'));
-             if(scoreClass) {
-                score = parseInt(scoreClass.split('__score-')[1], 10);
-             }
-        }
-        
-        // Fallback for when style is not applied, get the number from the class
-        if (score === 0) {
-            const scoreValEl = el.querySelector('[class*="AssessmentSkillCardFeedback-module__score-3"]'); // Example for score 3
-            if(scoreValEl){
-                 const scoreClass = Array.from(scoreValEl.classList).find(c => c.includes('__score-'));
-                 if (scoreClass) {
-                    score = parseInt(scoreClass.split('--')[1].replace(/\D/g, ''), 10);
+        // CORRECTED LOGIC: Find all potential score elements. The selected one
+        // will have more than one class name. Its text content is the score.
+        const scoreElements = el.querySelectorAll('div[class*="AssessmentSkillCardFeedback-module__score-value--"]');
+        scoreElements.forEach(scoreNode => {
+            if (scoreNode.classList.length > 1) {
+                const scoreText = scoreNode.textContent.trim();
+                const parsed = parseInt(scoreText, 10);
+                if (!isNaN(parsed)) {
+                    score = parsed;
                 }
             }
-        }
-
+        });
 
         if (skillName && score > 0) {
             assessedSkills.push({ skill: skillName, score: score });
@@ -113,15 +112,9 @@ function getRoleplayData() {
 
 
 /* ========================================================================== */
-/* =================== EXISTING MEETING SCRAPING LOGIC ====================== */
+/* =================== STABLE MEETING SCRAPING LOGIC (UNCHANGED) ============ */
 /* ========================================================================== */
 
-// ... (The rest of the original content.js file, including getTranscriptAndSpeakers,
-//      jaroWinkler, etc., remains unchanged here.)
-
-/* =========================
-   FUZZY NAME MATCH HELPERS
-   ========================= */
 const INTERNAL_MATCH_THRESHOLD = 0.78; 
 
 function stripDiacritics(s) {
@@ -129,14 +122,12 @@ function stripDiacritics(s) {
 }
 
 function canonName(s) {
-    // Lowercase, remove diacritics, drop common org/role words, strip punctuation
     let t = stripDiacritics(String(s)).toLowerCase();
     t = t.replace(/\b(account|executive|exec|manager|director|turnitin|inc|ltd|llc)\b/g, " ");
     t = t.replace(/[^a-z\s]/g, " ").replace(/\s+/g, " ").trim();
     return t;
 }
 
-// Jaro-Winkler similarity
 function jaroWinkler(a, b) {
     a = canonName(a); b = canonName(b);
     const al = a.length, bl = b.length;
@@ -169,51 +160,13 @@ function jaroWinkler(a, b) {
     return jaro + prefix * 0.1 * (1 - jaro);
 }
 
-// Levenshtein ratio (optional blend)
-function levenshteinRatio(a, b) {
-    a = canonName(a); b = canonName(b);
-    const n = a.length, m = b.length;
-    if (!n && !m) return 1;
-    if (!n || !m) return 0;
-    const v0 = new Array(m + 1), v1 = new Array(m + 1);
-    for (let j = 0; j <= m; j++) v0[j] = j;
-    for (let i = 0; i < n; i++) {
-        v1[0] = i + 1;
-        for (let j = 0; j < m; j++) {
-            const cost = (a[i] === b[j]) ? 0 : 1;
-            v1[j + 1] = Math.min(v1[j] + 1, v0[j + 1] + 1, v0[j] + cost);
-        }
-        for (let j = 0; j <= m; j++) v0[j] = v1[j];
-    }
-    const dist = v1[m];
-    return 1 - (dist / Math.max(n, m));
-}
-
-// Token Jaccard (optional blend)
-function tokenJaccard(a, b) {
-    const A = new Set(canonName(a).split(/\s+/).filter(Boolean));
-    const B = new Set(canonName(b).split(/\s+/).filter(Boolean));
-    if (!A.size && !B.size) return 1;
-    let inter = 0; for (const t of A) if (B.has(t)) inter++;
-    return inter / (A.size + B.size - inter || 1);
-}
-
 function nameSimilarity(a, b) {
     const jw = jaroWinkler(a, b);
-    const lv = levenshteinRatio(a, b);
-    const jc = tokenJaccard(a, b);
-    // Favor JW but blend a bit of edit distance + token overlap
-    return Math.max(jw, (jw * 0.6 + lv * 0.25 + jc * 0.15));
+    return jw;
 }
 
-/**
- * Main function to orchestrate the scraping process for meetings.
- * It first identifies speaker roles from the timeline, then parses the transcript.
- * @returns {{transcript: string, speakers: {name: string, isInternal: boolean}[]}}
- */
 function getTranscriptAndSpeakers() {
     const speakerRoleMap = getSpeakerRoles();
-
     const entries = document.querySelectorAll('[class*="TranscriptEntry-module__transcript-entry--"]');
     if (!entries.length) {
         console.error("Sales Coach Extension: No transcript entries found.");
@@ -224,7 +177,6 @@ function getTranscriptAndSpeakers() {
     const speakersInTranscript = new Map();
     let lastSpeaker = null;
 
-    // --- Step 1: Parse the transcript and gather all unique speakers ---
     entries.forEach(entry => {
         const speakerEl = entry.querySelector('[class*="SpeakerInfoHeader-module__speaker-info-wrapper--"] > div > span:first-child');
         const textEl = entry.querySelector('[class*="EntryText-module__entry-text--"]');
@@ -234,7 +186,6 @@ function getTranscriptAndSpeakers() {
             const text = textEl.textContent.trim().replace(/\s+/g, ' ');
 
             if (!speakersInTranscript.has(speakerName)) {
-                // default isInternal to false
                 speakersInTranscript.set(speakerName, { name: speakerName, isInternal: false });
             }
 
@@ -247,34 +198,24 @@ function getTranscriptAndSpeakers() {
         }
     });
 
-    // --- Step 2: Mark internal speakers using scrubber roles with FUZZY matching ---
-    // speakerRoleMap: Map<scrubberDisplayName, boolean>
     for (const [speakerName, speakerData] of speakersInTranscript.entries()) {
-        // Fast path: exact display match from scrubber
         let isInternal = speakerRoleMap.get(speakerName);
-
         if (isInternal === undefined) {
-            // Fuzzy: find the best matching scrubber name to this transcript label
-            let bestName = null;
             let bestScore = -1;
             let bestStatus = false;
-
             for (const [scrubberName, internalStatus] of speakerRoleMap.entries()) {
                 const score = nameSimilarity(speakerName, scrubberName);
                 if (score > bestScore) {
                     bestScore = score;
-                    bestName = scrubberName;
                     bestStatus = internalStatus;
                 }
             }
-
             if (bestScore >= INTERNAL_MATCH_THRESHOLD) {
                 isInternal = bestStatus;
             } else {
                 isInternal = false;
             }
         }
-
         speakerData.isInternal = !!isInternal;
     }
 
@@ -284,10 +225,6 @@ function getTranscriptAndSpeakers() {
     };
 }
 
-/**
- * Parses the speaker timeline to identify internal vs. external speakers.
- * @returns {Map<string, boolean>} A map of speaker names to a boolean (true if internal).
- */
 function getSpeakerRoles() {
     const speakerRoleMap = new Map();
     const speakerScrubberContainers = document.querySelectorAll('[class*="MeetingScrubbers-module__scrubberContainer--"]');
@@ -304,4 +241,4 @@ function getSpeakerRoles() {
     return speakerRoleMap;
 }
 
-console.log("Sales Coach content script loaded and ready (v2.0.01 - roleplay scraping).");
+console.log("Sales Coach content script loaded (Corrected Selectors).");

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Sales Coach Assessment Tool",
-  "version": "2.0.01",
+  "version": "2.0.04",
   "description": "Analyzes Highspot meeting transcripts to assess sales skills against a rubric.",
   "permissions": [
     "activeTab",
