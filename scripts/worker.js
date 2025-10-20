@@ -1,14 +1,13 @@
 // --- worker.js ---
 
-let index_v2;
 // ===================================================================================
 // >>>>>>>>>>>>>>>>>>>> ALL SHARED BUSINESS LOGIC & HELPER FUNCTIONS <<<<<<<<<<<<<<<<<
 // ===================================================================================
 
 const num = (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : d; };
 const bool = (v, d) => { if (v === undefined || v === null) return d; const s = String(v).toLowerCase().trim(); return s === "true" || s === "1" || s === "yes"; };
-const bytes = (s) => new TextEncoder().encode(String(s)).length;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function withRetry(fn, { retries = 2, baseMs = 500, factor = 1.8, jitter = true } = {}) {
   let attempt = 0, delay = baseMs, lastErr;
   while (attempt <= retries) {
@@ -25,37 +24,43 @@ async function withRetry(fn, { retries = 2, baseMs = 500, factor = 1.8, jitter =
   }
   throw lastErr;
 }
-async function fetchJSON(url, options = {}) {
-  const { hint = "upstream", timeoutMs = 120000 } = options;
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(new Error(`Timeout after ${timeoutMs}ms`)), timeoutMs);
-  let res, text;
-  try {
-    res = await fetch(url, { ...options, signal: ac.signal });
-    text = await res.text();
-  } catch (e) {
-    clearTimeout(timer);
-    throw new Error(`${hint} request failed: ${e?.message || e}`);
-  }
-  clearTimeout(timer);
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch {}
-  if (!res.ok) {
-    const snippet = (text || "").slice(0, 400).replace(/\s+/g, " ");
-    throw new Error(`${hint} ${res.status} ${res.statusText} – ${snippet || "no body"}`);
-  }
-  if (!data) {
-    const snippet = (text || "").slice(0, 400).replace(/\s+/g, " ");
-    throw new Error(`${hint} returned non-JSON – ${snippet || "empty body"}`);
-  }
-  return data;
+
+async function chatOpenRouter(env, payload, { hint = "openrouter" } = {}) {
+    if (!env.OPENROUTER_KEY) throw new Error(`${hint} missing OPENROUTER_KEY`);
+    const base = (env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/+$/,"");
+    const timeoutMs = num(env.OPENROUTER_TIMEOUT_MS, 120000);
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(new Error(`API call timed out after ${timeoutMs}ms`)), timeoutMs);
+    let res;
+    try {
+        res = await fetch(`${base}/chat/completions`, {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${env.OPENROUTER_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            signal: ac.signal,
+        });
+    } catch (e) {
+        clearTimeout(timer);
+        throw e;
+    } finally {
+        clearTimeout(timer);
+    }
+
+    if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`${hint} ${res.status}: ${errText.slice(0, 400)}`);
+    }
+    const json = await res.json();
+    const content = json?.choices?.[0]?.message?.content ?? "";
+    return { content, json };
 }
+
 function stable(obj) {
   const seen = new WeakSet();
   const sorter = (x) => {
     if (x && typeof x === "object") {
-      if (seen.has(x)) return null;
-      seen.add(x);
+      if (seen.has(x)) return null; seen.add(x);
       if (Array.isArray(x)) return x.map(sorter);
       return Object.keys(x).sort().reduce((o, k) => ((o[k] = sorter(x[k])), o), {});
     }
@@ -63,28 +68,26 @@ function stable(obj) {
   };
   return JSON.stringify(sorter(obj));
 }
+
 async function sha256Hex(s) {
   const data = new TextEncoder().encode(s);
   const hash = await crypto.subtle.digest("SHA-256", data);
   return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+function normalizeTranscript(s) {
+  if (!s) return "";
+  return String(s).replace(/\t/g, " ").replace(/[ \u00A0]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 function __normalizeTranscriptSimple(s) {
   if (!s) return "";
-  let t = String(s);
-  t = t.replace(/\t/g, " ")
-       .replace(/[ \u00A0]{2,}/g, " ")
-       .replace(/\n{3,}/g, "\n\n")
-       .trim();
-  return t;
+  return String(s).replace(/\t/g, " ").replace(/[ \u00A0]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
+
 async function simpleSkillKeyHash({ cacheVersion, transcript, sellerId, skillName }) {
-  const input = {
-    v: String(cacheVersion || "1"),
-    sellerId: String(sellerId || ""),
-    skillName: String(skillName || ""),
-    transcript: __normalizeTranscriptSimple(transcript || "")
-  };
-  return await sha256Hex(stable(input));
+    const input = { v: String(cacheVersion || "1"), sellerId: String(sellerId || ""), skillName: String(skillName || ""), transcript: normalizeTranscript(transcript || "") };
+    return await sha256Hex(stable(input));
 }
 
 async function kvGetJSON(ns, key) {
@@ -93,174 +96,10 @@ async function kvGetJSON(ns, key) {
   if (!s) return null;
   try { return JSON.parse(s); } catch { return null; }
 }
+
 async function kvPutJSON(ns, key, obj, ttlSecs, cacheVersion) {
   if (!ns) return;
-  await ns.put(key, JSON.stringify(obj), {
-    expirationTtl: ttlSecs,
-    metadata: { createdAt: Date.now(), version: cacheVersion },
-  });
-}
-
-function providerPrefs(env) {
-  const order = (env.PROVIDER_ORDER || "fireworks,together,groq,google,openai")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
-  const allow_fallbacks = String(env.ALLOW_FALLBACKS || "1") === "1";
-  return { order, allow_fallbacks };
-}
-
-async function chatOpenRouter(env, payload, { hint = "openrouter" } = {}) {
-  if (!env.OPENROUTER_KEY) throw new Error(`${hint} missing OPENROUTER_KEY`);
-  const base = (env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/+$/,"");
-  const timeoutMs = num(env.OPENROUTER_TIMEOUT_MS, 120000);
-
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(new Error(`Timeout after ${timeoutMs}ms`)), timeoutMs);
-
-  let res, raw;
-  try {
-    res = await fetch(`${base}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${env.OPENROUTER_KEY}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://yourapp.example",
-        "X-Title": "Sales Skills Worker"
-      },
-      body: JSON.stringify(payload),
-      signal: ac.signal
-    });
-    raw = await res.text();
-  } catch (e) {
-    clearTimeout(t);
-    throw new Error(`${hint} request failed: ${e?.message || e}`);
-  }
-  clearTimeout(t);
-
-  if (!res.ok) throw new Error(`${hint} ${res.status}: ${raw.slice(0,400)}`);
-  let json;
-  try { json = JSON.parse(raw); } catch {
-    throw new Error(`${hint} returned non-JSON: ${raw.slice(0,200)}`);
-  }
-  const servedBy = res.headers.get("openrouter-proxy-provider")
-                     || res.headers.get("x-openrouter-provider")
-                     || json?.provider?.name
-                     || json?.model
-                     || "unknown";
-  const content = json?.choices?.[0]?.message?.content ?? "";
-  return { content, servedBy, raw, json };
-}
-
-const OR_SYSTEM_JUDGE = `
-You are an objective rubric grader. Your entire response MUST be a single, valid JSON object that calls the 'extract_rubric_analysis' tool. Do not add any text outside the JSON.
-
-MANDATORY RULES:
-- Include EVERY level and EVERY characteristic from the provided rubric.
-- Evidence MUST be a direct, verbatim quote from the user-provided transcript and be less than 160 characters.
-- For EVERY check, you MUST provide a 'reason' and attempt to find 'evidence', even if 'met' is false.
-
-- **CONTEXT IS PARAMOUNT:** Your assessment must be based on the overall conversational flow. Do not penalize rhetorical questions.
-
-- **LIMITATION LOGIC:** For any check with 'polarity: "limitation"', you MUST follow this two-step process:
-  1. First, ask internally: 'Was the seller's performance WORSE than the described limitation?'
-  2. If the answer is YES, you MUST set 'met: false'. If the answer is NO (meaning performance was the same as OR better), you MUST set 'met: true'.
-  3. **IMPORTANT:** If the seller's performance is EXACTLY EQUAL to the described limitation (not worse, not better), you MUST set 'met: true'. Do NOT penalize for being exactly at the limitation threshold. Your 'reason' must explicitly state which of these conditions was met.
-  4. **EXCEPTION FOR ABSENCE:** If a Level 1 limitation describes a complete lack of a skill (e.g., "Demonstrates little to no understanding"), and you find no evidence of that skill in the entire transcript, you MUST set 'met: true' and your reason should state "The skill was not demonstrated at any point in the conversation."
-
-- **DO NOT HALLUCINATE:** You are strictly forbidden from inventing evidence or using any text from this system prompt in your 'evidence' field. All evidence must originate from the user's transcript.
-`;
-
-const OR_SYSTEM_COACH = `
-You are a practical, expert sales coach. Your task is to provide concise, actionable feedback based on a provided analysis. You MUST follow the JSON schema and rules below perfectly.
-{
-  "strengths": ["..."],
-  "improvements": [{
-    "point": "High-level area for improvement.",
-    "example": {
-      "instead_of": "The seller's actual quote demonstrating the gap.",
-      "try_this": "A better, alternative phrase the seller could have used."
-    }
-  }],
-  "coaching_tips": ["..."]
-}
-**CRITICAL RULES FOR YOUR TASK:**
-1.  **Generate 'strengths':** Write 2-4 strengths from the highest-rated "met: true" positive characteristics. If none are met, this MUST be an empty array.
-2.  **Generate 'improvements':** This is your most important task. Generate 3-5 improvements.
-    - Base your improvements on the **unmet 'positive' characteristics** from the rubric, starting with the lowest levels first. These are the foundational skills.
-    - For the 'example' object:
-        - **'instead_of'**: Use the verbatim quote provided in the analysis. **If the quote seems generic or irrelevant**, explain the conversational context where the skill was missed. For example: "When the customer expressed concern about the product's fit, the seller changed the subject."
-        - **'try_this'**: Write a short, practical, and superior alternative the seller could have used in that specific situation.
-3.  **Generate 'coaching_tips':** Write 3-6 actionable tips directly related to the 'improvements'. Your tips must be grounded in the conversational context.
-`;
-
-const BUCKET_ORDER = [
-  "ask_probe","clarify_validate","summarize_synthesize","empathize_label",
-  "quantify_measure","connect_link","document_commit","explain_teach",
-  "position_value","other"
-];
-
-function sortQuotesDeterministic(arr) {
-  const uniq = [...new Set((arr || []).map(String).map(s => s.trim()).filter(Boolean))];
-  return uniq.sort((a, b) => {
-    const lc = a.toLowerCase().localeCompare(b.toLowerCase());
-    return lc !== 0 ? lc : (a.length - b.length);
-  });
-}
-
-function makeNormalizeQuote(maxQuoteWords = 50, enforce = true) {
-  return function normalizeQuote(q) {
-    const t = String(q || "").replace(/\s+/g, " ").trim();
-    if (!t) return "";
-    if (!enforce) return t;
-    const words = t.split(" ");
-    return words.length <= maxQuoteWords ? t : words.slice(0, maxQuoteWords).join(" ");
-  };
-}
-
-function getQuotePosMap(transcript, quotes, normalizeQuote) {
-    const lower = String(transcript || "").toLowerCase();
-    const m = new Map();
-    for (const q of (quotes || [])) {
-        const t = normalizeQuote(q);
-        if (!t) continue;
-        const pos = lower.indexOf(t.toLowerCase());
-        m.set(t, pos >= 0 ? pos : Number.MAX_SAFE_INTEGER);
-    }
-    return m;
-}
-
-function selectWhitelistForSkill(index, skillName, maxN, transcript, opts = {}) {
-  const normalizeQuote = makeNormalizeQuote(opts.maxQuoteWords ?? 50, opts.enforce ?? true);
-  const all = (index?.seller_quotes || []).map(normalizeQuote).filter(Boolean);
-  if (!all.length) return [];
-  const posMap = getQuotePosMap(transcript, all, normalizeQuote);
-  const eb = index?.evidence_buckets || {};
-  const picked = [];
-  const seen = new Set();
-  for (const b of BUCKET_ORDER) {
-    const inBucket = (eb[b] || []).map(normalizeQuote).filter(q => q && all.includes(q)).sort((a, bq) => (posMap.get(a) || 1e15) - (posMap.get(bq) || 1e15));
-    for (const q of inBucket) {
-      if (!seen.has(q)) {
-        picked.push(q);
-        seen.add(q);
-        if (picked.length >= maxN) return picked;
-      }
-    }
-  }
-  const remaining = all.filter(q => !seen.has(q)).sort((a, bq) => (posMap.get(a) || 1e15) - (posMap.get(bq) || 1e15));
-  for (const q of remaining) {
-    picked.push(q);
-    if (picked.length >= maxN) break;
-  }
-  return picked;
-}
-
-function normalizeTranscript(s) {
-  if (!s) return "";
-  let t = String(s);
-  t = t.replace(/\t/g, " ").replace(/[ \u00A0]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
-  return t;
+  await ns.put(key, JSON.stringify(obj), { expirationTtl: ttlSecs, metadata: { createdAt: Date.now(), version: cacheVersion } });
 }
 
 function normKey(s) {
@@ -283,2355 +122,405 @@ function resolveSkill(rubricsObj, requestedName) {
   return m.get(normKey(requestedName)) || null;
 }
 
-function getQuoteContextWindow(transcript, quote, chars = 220) {
-  const t = String(transcript || "");
-  const q = String(quote || "").trim();
-  if (!t || !q) return "";
-  const lower = t.toLowerCase();
-  const qi = lower.indexOf(q.toLowerCase());
-  if (qi < 0) return "";
-  const start = Math.max(0, qi - chars), end = Math.min(t.length, qi + q.length + chars);
-  const s = t.lastIndexOf("\n", start);
-  const e = t.indexOf("\n", end);
-  return t.slice(s > -1 ? s + 1 : start, e > -1 ? e : end).trim();
-}
-
-function getBucketForQuote(quote, evidence_buckets) {
-  if (!quote || !evidence_buckets) return null;
-  for (const b of BUCKET_ORDER) {
-    const arr = evidence_buckets[b] || [];
-    if (arr.some(q => String(q).trim() === String(quote).trim())) return b;
-  }
-  return null;
-}
-
-function inferQuoteIntent(quote, context) {
-  const q = (quote || "").toLowerCase();
-  const c = (context || "").toLowerCase();
-  const demoMarkers = ["for example", "example:", "e.g.", "let's say", "imagine", "like that type of thing"];
-  const hedgeMarkers = ["you probably wouldn’t", "not in your case", "you may not need", "might not need"];
-  return {
-    is_demo: demoMarkers.some(m => q.includes(m) || c.includes(m)),
-    is_hedge: hedgeMarkers.some(m => q.includes(m) || c.includes(m)),
-  };
-}
-
-
-function desiredActsFromRubric(rubricData) {
-    const allTxt = [];
-    if (!rubricData) return new Set();
-    const levels = rubricData.levels || rubricData;
-    for (const lvl of levels || []) {
-        for (const ch of (lvl.checks || [])) {
-            if (ch && ch.characteristic) allTxt.push(String(ch.characteristic));
-            if (ch && ch.reason) allTxt.push(String(ch.reason));
-        }
-    }
-    const blob = allTxt.join(" ").toLowerCase();
-
-    const actScores = new Map();
-    const bump = (act, n=1) => actScores.set(act, (actScores.get(act) || 0) + n);
-
-    if (/\b(question|ask|probe|discover|uncover|why|how|what)\b/.test(blob)) bump("ask_probe", 2);
-    if (/\b(clarif|confirm|validate|align|verify)\b/.test(blob)) bump("clarify_validate", 2);
-    if (/\b(summariz|synthes|recap|frame|structure|organize|visual)\b/.test(blob)) bump("summarize_synthesize", 2);
-    if (/\b(empath|acknowledge|feel|concern)\b/.test(blob)) bump("empathize_label", 2);
-    if (/\b(roi|metric|kpi|measure|quantif|business case|numbers|%|percent|data)\b/.test(blob)) bump("quantify_measure", 2);
-    if (/\b(connect|link|tie back|reference|use case|case study|example)\b/.test(blob)) bump("connect_link", 2);
-    if (/\b(next step|commit|follow[- ]?up|close|schedule|plan|action)\b/.test(blob)) bump("document_commit", 2);
-    if (/\b(explain|teach|educat|demonstrate|walkthrough|how it works)\b/.test(blob)) bump("explain_teach", 2);
-    if (/\b(value|benefit|impact|outcome|why this matters|advantages)\b/.test(blob)) bump("position_value", 2);
-
-    if (actScores.size === 0) {
-        bump("summarize_synthesize",1);
-        bump("position_value",1);
-    }
-    return new Set(Array.from(actScores).filter(([k,v]) => v >= 1).map(([k]) => k));
-}
-
-function enforceEvidenceQualityForPositivesDynamic(levelChecks, idx2, rubricData) {
-  if (!idx2 || !Array.isArray(idx2.snippets)) return levelChecks;
-  const SELLER = idx2?.seller?.resolved_seller_id;
-  const desired = desiredActsFromRubric(rubricData);
-  if (!desired.size) return levelChecks;
-
-  const byText = new Map();
-  for (const s of idx2.snippets) byText.set(String(s.text).toLowerCase(), s);
-
-  for (const lvl of levelChecks || []) {
-    for (const ch of (lvl.checks || [])) {
-      if (!ch.met || ch.polarity !== "positive") continue;
-      const ev = (ch.evidence || []).map(e => String(e).toLowerCase());
-      const qualifies = ev.some(t => {
-        const sn = byText.get(t);
-        if (!sn) return false;
-        if (SELLER && sn.speaker !== SELLER) return false;
-        const acts = new Set(sn.acts || []);
-        return [...desired].some(a => acts.has(a));
-      });
-      if (!qualifies) {
-        ch.met = false;
-        ch.observable = false;
-        ch.reason = (ch.reason ? ch.reason + " " : "") + "[auto] unmet: no seller evidence matching rubric-desired acts.";
-      }
-    }
-  }
-  return levelChecks;
-}
-
+const OR_SYSTEM_COACH = `
+You are a practical, expert sales coach. Your task is to provide concise, actionable feedback based on a provided analysis. You MUST follow the JSON schema and rules below perfectly.
+{ "strengths": ["..."], "improvements": [{"point": "...", "example": {"instead_of": "...", "try_this": "..."}}], "coaching_tips": ["..."] }
+**RULES:**
+1.  **Strengths**: Write 2-4 strengths based on the provided score.
+2.  **Improvements**: Find 3-5 missed opportunities in the transcript.
+3.  **Coaching Tips**: Write 3-6 actionable tips related to the improvements.`;
 
 // ===================================================================================
-// >>>>>>>>>>>>>>>>>>>>>> ROUTE HANDLERS & MAIN EXPORT <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+// >>>>>>>>>>>>>>>>>>>>>>>>>>>> PROMPT BUILDERS & CORE LOGIC <<<<<<<<<<<<<<<<<<<<<<<<<
 // ===================================================================================
 
-async function handlePreAssessment(request, env) {
-    // This function is self-contained and correct
-    try {
-        const body = await request.json().catch(() => ({}));
-        const { transcript, allSkills } = body;
-        const GEMINI_API_KEY = env.GEMINI_API_KEY;
-        const INDEX_MODEL = (env.INDEX_MODEL || "gemini-2.5-flash").trim();
-        const CACHE_VERSION   = String(env.CACHE_VERSION || "1");
-        const KV_TTL_SECS     = num(env.KV_TTL_SECS,   60 * 60 * 24 * 7);
+function buildAnalysisPrompt(skillName, rubricData, transcript, sellerName) {
+    const sortedRubric = stable(rubricData);
+    return `You are an OBJECTIVE AI Analyst. Your only function is to grade a sales transcript against a provided rubric for a seller named "${sellerName}". You must follow a strict reasoning process before making a final determination.
 
-        if (!transcript || !Array.isArray(allSkills) || allSkills.length === 0) {
-            return new Response(JSON.stringify({ error: "Missing 'transcript' or 'allSkills' in request body." }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-        }
-
-        const cacheKeyInput = stable({ v: CACHE_VERSION, transcript, allSkills });
-        const cacheKeyHash = await sha256Hex(cacheKeyInput);
-        const kvKey = `v${CACHE_VERSION}:pre-assess:${cacheKeyHash}`;
-
-        if (env.ASSESS_CACHE) {
-            const cached = await kvGetJSON(env.ASSESS_CACHE, kvKey);
-            if (cached) {
-                return new Response(JSON.stringify(cached), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-            }
-        }
-
-        function buildPreAssessmentPrompt(transcript, skillsList) {
-            return `
-                You are an efficient AI analyst. Your task is to review a sales call transcript and determine which predefined skills are demonstrably present in the seller's dialogue.
-                Analyze the following transcript. Based on the conversation, identify which of the skills from the provided list are clearly and substantially discussed or demonstrated by the speakers.
-                **CRITICAL RULES:**
-                - Only return skills that have significant evidence in the text.
-                - Your response MUST be a valid JSON array of strings, containing only the names of the relevant skills from the list.
-                - If no skills are clearly present, return an empty array [].
-                **Full List of Possible Skills:** ${JSON.stringify(skillsList, null, 2)}
-                **Transcript:**\n---\n${transcript}\n---\nReturn ONLY the JSON array.`;
-        }
-
-        const prompt = buildPreAssessmentPrompt(transcript, allSkills);
-        const googleURL = (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
-        const requestBody = {
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
-            generationConfig: { responseMimeType: "application/json", temperature: 0.0, },
-            safetySettings: [
-                { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-                { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-                { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-                { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-            ],
-        };
-
-        const response = await fetch(googleURL(INDEX_MODEL), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(requestBody) });
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`Gemini API Error: ${response.status} ${errorText}`);
-        }
-        const result = await response.json();
-        const relevantSkillsText = result.candidates?.[0]?.content?.parts?.[0]?.text;
-        let responsePayload = { skills: [] };
-        if (relevantSkillsText) {
-            try {
-                responsePayload.skills = JSON.parse(relevantSkillsText);
-            } catch (e) {
-                throw new Error("Pre-assessment AI returned invalid JSON.");
-            }
-        }
-        if (env.ASSESS_CACHE) {
-            await kvPutJSON(env.ASSESS_CACHE, kvKey, responsePayload, KV_TTL_SECS, CACHE_VERSION);
-        }
-        return new Response(JSON.stringify(responsePayload), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-    } catch (error) {
-        return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } });
-    }
-}
-
-function buildSimplifiedCoachingPrompt(skillName, rating, rubricData, transcript) {
-  // Find the next level's characteristics to guide the LLM
-  const nextLevelNumber = rating + 1;
-  const nextLevel = (rubricData.levels || []).find(l => l.level === nextLevelNumber);
-  const improvementFocus = nextLevel ? `Focus on the characteristics from Level ${nextLevelNumber} ('${nextLevel.name}') as the primary areas for improvement.` : "Focus on general best practices to advance beyond the current level.";
-
-  return `
-You are a practical, expert sales coach. Your task is to provide concise, actionable feedback based on the provided transcript, the seller's assessed skill level, and the skill rubric.
-
-You MUST return a single, valid JSON object matching the schema below and nothing else.
-{
-"strengths": ["..."],
-"improvements": [{
-  "point": "High-level area for improvement, based on the next level's characteristics.",
-  "example": {
-    "instead_of": "A verbatim quote from the transcript demonstrating where the skill was missed.",
-    "try_this": "A better, alternative phrase the seller could have used in that specific moment."
-  }
-}],
-"coaching_tips": ["..."]
-}
-
-**CONTEXT:**
-- **Skill:** "${skillName}"
-- **Assessed Level:** The seller has demonstrated proficiency at **Level ${rating}**.
-
-**YOUR TASK:**
-1.  **Analyze the Transcript:** Read the entire transcript provided below.
-2.  **Generate 'strengths':** Based on the characteristics of **Level ${rating}** (and below) in the rubric, write 2-4 strengths the seller demonstrated.
-3.  **Generate 'improvements':** Find 1-3 moments in the transcript where the seller missed an opportunity to perform at the next level. ${improvementFocus}
-  - For each moment, create an improvement object:
-      - **'point'**: State the specific higher-level characteristic that was missed.
-      - **'instead_of'**: Pull a **direct, verbatim quote** from the transcript that shows this missed opportunity.
-      - **'try_this'**: Write a short, practical, and superior alternative the seller could have used.
-4.  **Generate 'coaching_tips':** Write 3-6 actionable tips that are directly related to the 'improvements' you identified.
-
-**FULL SKILL RUBRIC:**
-${stable(rubricData)}
-
-**FULL TRANSCRIPT:**
+**TRANSCRIPT:**
 ---
 ${transcript}
 ---
-`;
+
+**SKILL RUBRIC:**
+---
+${sortedRubric}
+---
+
+**TASK:**
+For EACH characteristic in EACH level of the rubric, you must perform the following chain of thought:
+1.  **Understand the Ask:** Paraphrase the core seller behavior described.
+2.  **Scan & Identify:** Find ALL potentially relevant quotes from "${sellerName}".
+3.  **Critique & Filter:** Discard weak quotes that require too much inference.
+4.  **Synthesize & Justify:** Formulate your 'reason' based on the filtered evidence.
+5.  **Final Determination:** Set 'met' to 'true' or 'false'.
+
+After completing this process for every single characteristic, assemble the final JSON object. Your entire response MUST be only this JSON object, conforming to the schema and example below.
+
+**JSON OUTPUT EXAMPLE:**
+Your final output MUST follow this exact structure.
+\`\`\`json
+{
+  "level_checks": [
+    {
+      "level": 1,
+      "name": "Novice",
+      "checks": [
+        {
+          "characteristic": "The first characteristic from the rubric for Level 1.",
+          "polarity": "limitation",
+          "met": false,
+          "evidence": ["An example quote if found, otherwise empty array."],
+          "reason": "Your detailed justification based on the chain of thought."
+        }
+      ]
+    }
+  ]
+}
+\`\`\`
+
+**CRITICAL RULE 1:** The example above is for structure only. You MUST NOT use the content from the example in your response. Your analysis must be based entirely on the provided transcript and rubric.
+
+**CRITICAL RULE 2:** If any of your 'reason' or 'evidence' strings contain double quotes ("), you MUST escape them with a backslash (\\"). For example, "He said \\"great.\\""`;
 }
 
-async function handleCacheCheck(request, env) {
-    const headers = { "Content-Type": "application/json; charset=utf-8" };
-    try {
-        const body = await request.json().catch(() => ({}));
-        const { transcript, sellerId, skills } = body;
-        if (!transcript || !sellerId || !Array.isArray(skills) || skills.length === 0) {
-            return new Response(JSON.stringify({ error: "Missing required fields for cache check." }), { status: 400, headers });
+
+function buildSimplifiedCoachingPrompt(skillName, rating, rubricData, transcript) {
+  const nextLevelNumber = rating + 1;
+  const nextLevel = (rubricData.levels || []).find(l => l.level === nextLevelNumber);
+  const improvementFocus = nextLevel ? `Focus on the characteristics from Level ${nextLevelNumber} ('${nextLevel.name}') as the primary areas for improvement.` : "Focus on general best practices.";
+  return `You are a practical, expert sales coach. Your task is to provide concise, actionable feedback based on the provided transcript, the seller's assessed skill level, and the skill rubric. You MUST return a single, valid JSON object matching the schema in the system prompt and nothing else.
+**CONTEXT:**
+- **Skill:** "${skillName}"
+- **Assessed Level:** The seller has demonstrated proficiency at **Level ${rating}**.
+**YOUR TASK:**
+1.  **Analyze Transcript:** Read the full transcript.
+2.  **Generate 'strengths'**: Based on **Level ${rating}** characteristics, write 2-4 strengths.
+3.  **Generate 'improvements'**: Find 1-3 moments where the seller missed a chance to perform at the next level. ${improvementFocus}
+4.  **Generate 'coaching_tips'**: Write 3-6 actionable tips related to the improvements.
+**FULL SKILL RUBRIC:** ${stable(rubricData)}
+**FULL TRANSCRIPT:**
+---
+${transcript}
+---`;
+}
+
+function computeHighestDemonstrated(levels) {
+    if (!Array.isArray(levels) || levels.length === 0) return 1;
+    const didPassLevel = (lvl) => {
+        if (!lvl || !Array.isArray(lvl.checks)) return true;
+        const positives = lvl.checks.filter(c => (c.polarity || "positive") === "positive" && (c.observable ?? true));
+        const allPositivesMet = positives.length === 0 || positives.every(c => c.met === true);
+        const limitations = lvl.checks.filter(c => c.polarity === "limitation" && (c.observable ?? true));
+        const allLimitationsMet = limitations.every(c => c.met === true);
+        return allPositivesMet && allLimitationsMet;
+    };
+    const sorted = [...levels].sort((a,b) => (a.level||0) - (b.level||0));
+    let highest = 0;
+    for (const lvl of sorted) {
+        if (didPassLevel(lvl)) {
+            highest = Math.max(highest, lvl.level || 0);
         }
-        const normTranscript = normalizeTranscript(transcript);
-        const CACHE_VERSION = String(env.CACHE_VERSION || "1");
-        const cachedStatus = {};
-        await Promise.all(
-            skills.map(async (skillName) => {
-                const skillKeyHash = await simpleSkillKeyHash({ cacheVersion: CACHE_VERSION, transcript: normTranscript, sellerId, skillName });
-                const kvKey = `v${CACHE_VERSION}:assess_skill:${skillKeyHash}`;
-                const cached = env.ASSESS_CACHE ? await kvGetJSON(env.ASSESS_CACHE, kvKey) : null;
-                cachedStatus[skillName] = !!(cached && cached.assessment && !cached.assessment.__error);
-            })
-        );
-        return new Response(JSON.stringify(cachedStatus), { headers });
-    } catch (error) {
-        return new Response(JSON.stringify({ error: error.message }), { status: 500, headers });
     }
+    return highest > 0 ? highest : 1;
+}
+
+function buildCoachingPrompt(skillName, rating, levelChecks) {
+  return `You are an expert AI Sales Coach. The analysis for "${skillName}" has a final rating of ${rating}/5. Use ONLY this analysis: ${stable({ level_checks: levelChecks })}.
+  YOUR TASK: Return ONLY JSON.
+  - 2-4 strengths from the highest achieved level.
+  - 3-5 improvements based on unmet characteristics.
+  - 3-6 actionable coaching tips mapped to the improvements.`;
+}
+
+async function getAssessmentForSkillNew(env, transcript, skillName, rubricData, sellerId) {
+    const tA0 = Date.now();
+    const judgeUserPrompt = buildAnalysisPrompt(skillName, rubricData, transcript, sellerId);
+
+    const judgeResp = await chatOpenRouter(env, {
+        model: env.JUDGE_MODEL || "openai/gpt-4o",
+        temperature: 0.1, max_tokens: 4096,
+        response_format: { type: "json_object" },
+        messages: [{ role: "system", content: "You are an objective rubric grader. Your entire response MUST be a single, valid JSON object that conforms to the user's example. Follow all rules precisely." }, { role: "user", content: judgeUserPrompt }],
+    }, { hint: "judge" });
+
+    let parsedJudge;
+    try {
+        parsedJudge = JSON.parse(judgeResp.content);
+    } catch (e) { throw new Error(`Judge returned invalid JSON for ${skillName}: ${e.message}`); }
+
+    const levelChecks = parsedJudge.level_checks || [];
+    const rating = computeHighestDemonstrated(levelChecks);
+
+    const coachUserPrompt = buildCoachingPrompt(skillName, rating, levelChecks);
+    const coachResp = await chatOpenRouter(env, {
+        model: env.COACH_MODEL || "openai/gpt-4o-mini",
+        temperature: 0.2, max_tokens: 2048, response_format: { type: "json_object" },
+        messages: [{ role: "system", content: OR_SYSTEM_COACH }, { role: "user", content: coachUserPrompt }]
+    }, { hint: "coach" });
+
+    let coachingResult = { strengths: [], improvements: [], coaching_tips: [] };
+    try { coachingResult = JSON.parse(coachResp.content); }
+    catch (e) { console.error(`Coach returned invalid JSON for ${skillName}: ${e.message}`); }
+
+    return { skill: skillName, rating, ...coachingResult, level_checks: levelChecks, _debug: { duration: Date.now() - tA0, raw_judge: parsedJudge } };
+}
+
+// ===================================================================================
+// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> ROUTE HANDLERS <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+// ===================================================================================
+
+async function handleQualifySkills(request, env) {
+  const headers = { "Content-Type": "application/json; charset=utf-8" };
+  const body = await request.json().catch(() => ({}));
+  const { transcript, allSkills, sellerId } = body;
+  const CACHE_VERSION = String(env.CACHE_VERSION || "1");
+  const KV_TTL_SECS = num(env.KV_TTL_SECS, 60 * 60 * 24 * 7);
+
+  if (!transcript || !Array.isArray(allSkills) || !sellerId) {
+    return new Response(JSON.stringify({ error: "Missing 'transcript', 'allSkills', or 'sellerId'." }), { status: 400, headers });
+  }
+
+  const normTranscript = normalizeTranscript(transcript);
+
+  // OPTIONAL (recommended): give the model light rubric awareness without changing the API
+  // If RUBRICS is unavailable this safely no-ops.
+  let rubricContext = "";
+  try {
+    const rubricsText = await env.RUBRICS.get(env.DEFAULT_RUBRIC_SET || "rubrics:v1", "text");
+    if (rubricsText) {
+      const rubricsObj = JSON.parse(rubricsText);
+      // Build a compact competency→skills hint to steer stage-appropriate picks while keeping tokens low
+      const hints = Object.entries(rubricsObj || {}).map(([comp, v]) => {
+        const skills = Object.keys((v && v.skills) || {}).slice(0, 12); // cap per comp to stay lean
+        return { competency: comp, skills };
+      });
+      rubricContext = JSON.stringify(hints, null, 2);
+    }
+  } catch (_) { /* ignore rubric hint errors */ }
+
+  const cacheKeyInput = stable({ v: CACHE_VERSION, transcript: normTranscript, sellerId, allSkills });
+  const cacheKeyHash = await sha256Hex(cacheKeyInput);
+  const kvKey = `v${CACHE_VERSION}:qualify:${cacheKeyHash}`;
+  if (env.ASSESS_CACHE) {
+    const cached = await kvGetJSON(env.ASSESS_CACHE, kvKey);
+    if (cached) return new Response(JSON.stringify(cached), { headers });
+  }
+
+  // === NEW PROMPT (stage-aware, rubric-aware, adaptive, non-exhaustive) ===
+  const qualificationPrompt = `You are an expert sales coach AI embedded in a sales enablement workflow. Select which skills from the provided catalog the SELLER demonstrated with enough substance to be coachable **for this call**.
+
+**Seller:** ${sellerId}
+
+**Transcript:**
+---
+${normTranscript}
+---
+
+**Skill Catalog (use these exact strings verbatim in output; map by meaning with fuzzy/synonym matching):**
+${JSON.stringify(allSkills, null, 2)}
+
+${
+  rubricContext
+    ? `**Competency Hints (for context only, not exhaustive):**
+${rubricContext}`
+    : ""
+}
+
+**GUIDANCE (do not include this section in your output):**
+1) **Detect Call Context/Stage (non-exhaustive):** Infer the meeting type from behavior and goals (e.g., intro discovery/qualification, multi-stakeholder discovery, CSM check-in, technical deep-dive, demo, commercial/negotiation, renewal, expansion, exec alignment, handoff, implementation planning, QBR/EBR, partner, procurement/legal, etc.). These are examples, not a closed list.
+
+2) **Rubric Awareness:** Decide if a skill is assessable like a rubric grader: was there enough signal for a fair evaluation **today**? Prefer skills that logically fit the detected stage.  
+   - Discovery/Qualification examples to prioritise: rapport/agenda, stakeholder/authority mapping, current process & tooling, needs/pain points, desired outcomes/success criteria, technical fit/constraints, compliance/language/regions, volume/scale, timeline/urgency, budget/financial fit, decision process/procurement, competitive landscape, closing for next step.
+
+3) **Evidence Threshold (inclusive but meaningful):** Qualify a skill if **either**  
+   a) it appears in one **substantive episode** (a short sequence of seller turns that explores/summarizes/advances that skill), **or**  
+   b) it appears in **two separate moments** in the call.  
+   Stage exceptions: a single clear action can qualify **Agenda/Framing**, **Next Step/Close**, or **Logistics/Time-zone coordination**.  
+   Do **not** include skills that are only one-off superficial mentions.
+
+4) **Map by Meaning, Not Keywords:** e.g., “Who else would be involved?” → Buying Centre/Decision Process; “When would you want to move ahead?” → Timeline/Urgency; “Do you have a budget set aside?” → Budget/Financial Fit; “We use Moodle; need exam security; AI policy in English” → Current Process/Tooling, Technical Fit, Compliance/Language, Needs/Desired Outcomes.
+
+5) **Adaptive Inclusivity:**  
+   - If you find **fewer than 6** qualifying skills, slightly relax to accept strong single episodes (avoid under-selection on early-stage calls).  
+   - If you find **more than 12**, keep only the strongest **8–12** that are most stage-appropriate.
+
+6) **Catalog Integrity:** Output **only** strings that appear in the Skill Catalog. No paraphrases or new names. No duplicates.
+
+**OUTPUT (strict):**  
+Return ONLY a valid JSON object with a single key **"qualifiedSkills"** whose value is an array of strings (ideally 8–12) from the catalog. No other keys or text.
+
+**RETURN ONLY:**
+{"qualifiedSkills":[/* exact catalog strings here */]}
+`;
+
+  const qualificationResp = await chatOpenRouter(env, {
+    model: env.JUDGE_MODEL || "openai/gpt-4o",
+    temperature: 0.0,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: "You are an AI analyst that only responds with JSON." },
+      { role: "user", content: qualificationPrompt }
+    ],
+  }, { hint: "qualify" });
+
+  let qualifiedSkills = [];
+  try {
+    const parsed = JSON.parse(qualificationResp.content);
+    qualifiedSkills = parsed.qualifiedSkills || [];
+  } catch (e) {
+    console.error("Failed to parse qualification response:", e);
+    qualifiedSkills = [];
+  }
+
+  const responsePayload = { qualifiedSkills, sellerIdentity: sellerId };
+  if (env.ASSESS_CACHE) {
+    await kvPutJSON(env.ASSESS_CACHE, kvKey, responsePayload, KV_TTL_SECS, CACHE_VERSION);
+  }
+  return new Response(JSON.stringify(responsePayload), { headers });
+}
+
+
+
+async function handleFullAssessment(request, env) {
+    const t0 = Date.now();
+    const headers = { "Content-Type": "application/json; charset=utf-8" };
+    const body = await request.json().catch(() => ({}));
+    const { transcript, skills, sellerId } = body;
+    const CACHE_VERSION = String(env.CACHE_VERSION || "1");
+    const KV_TTL_SECS = num(env.KV_TTL_SECS, 60 * 60 * 24 * 14);
+
+    if (!transcript || !Array.isArray(skills) || skills.length === 0 || !sellerId) {
+        return new Response(JSON.stringify({ error: "Missing 'transcript', 'skills', or 'sellerId'." }), { status: 400, headers });
+    }
+
+    const normTranscript = normalizeTranscript(transcript);
+    const rubricsText = await env.RUBRICS.get(env.DEFAULT_RUBRIC_SET || "rubrics:v1", "text");
+    if (!rubricsText) throw new Error("Could not load rubrics from KV.");
+    const allRubrics = JSON.parse(rubricsText);
+    const resolvedSkills = skills.map(s => resolveSkill(allRubrics, s)).filter(Boolean);
+    const assessments = [];
+
+    for (const { skillName, rubricData } of resolvedSkills) {
+        const skillKeyHash = await simpleSkillKeyHash({ cacheVersion: CACHE_VERSION, transcript: normTranscript, sellerId, skillName });
+        const kvKey = `v${CACHE_VERSION}:assess_skill_v2:${skillKeyHash}`;
+
+        if (env.ASSESS_CACHE) {
+            const cached = await kvGetJSON(env.ASSESS_CACHE, kvKey);
+            if (cached && cached.assessment) {
+                assessments.push(cached.assessment);
+                continue;
+            }
+        }
+
+        const assessment = await getAssessmentForSkillNew(env, normTranscript, skillName, rubricData, sellerId);
+        assessments.push(assessment);
+
+        if (env.ASSESS_CACHE) {
+            await kvPutJSON(env.ASSESS_CACHE, kvKey, { assessment }, KV_TTL_SECS, CACHE_VERSION);
+        }
+    }
+
+    const responsePayload = {
+        assessments,
+        meta: { duration_ms: Date.now() - t0, run_id: crypto.randomUUID() },
+        seller_identity: sellerId
+    };
+
+    return new Response(JSON.stringify(responsePayload), { headers });
 }
 
 async function handleCoachingFeedback(request, env) {
   const t0 = Date.now();
   const headers = { "Content-Type": "application/json; charset=utf-8" };
-  try {
-      const body = await request.json().catch(() => ({}));
-      let { transcript, skills } = body;
+  const body = await request.json().catch(() => ({}));
+  const { transcript, skills } = body;
+  const CACHE_VERSION = String(env.CACHE_VERSION || "1");
+  const KV_TTL_SECS = num(env.KV_TTL_SECS, 60 * 60 * 24 * 7);
 
-      if (!transcript || !Array.isArray(skills) || skills.length === 0) {
-          return new Response(JSON.stringify({ error: "Missing 'transcript' or 'skills' in request body." }), { status: 400, headers });
-      }
-
-      const CACHE_VERSION = String(env.CACHE_VERSION || "1");
-      const KV_TTL_SECS = num(env.KV_TTL_SECS, 60 * 60 * 24 * 7);
-      const WRITER_MODEL = env.WRITER_MODEL || "openai/gpt-4o-mini"; // Or your preferred coach model
-      const setKey = env.DEFAULT_RUBRIC_SET || "rubrics:v1";
-
-      const normTranscript = __normalizeTranscriptSimple(transcript);
-
-      const cacheKeyInput = stable({
-          v: CACHE_VERSION,
-          transcript: normTranscript,
-          skills,
-          writerModel: WRITER_MODEL,
-          rubricSet: setKey,
-          // Add a key to differentiate this from the old method
-          logic_version: "simplified_coach_v1"
-      });
-      const cacheKeyHash = await sha256Hex(cacheKeyInput);
-      const kvKey = `v${CACHE_VERSION}:coach:${cacheKeyHash}`;
-
-      if (env.ASSESS_CACHE) {
-          const cached = await kvGetJSON(env.ASSESS_CACHE, kvKey);
-          if (cached) {
-              cached.meta = cached.meta || {};
-              cached.meta.kv_hit = true;
-              cached.meta.duration_ms = Date.now() - t0;
-              return new Response(JSON.stringify(cached), { headers });
-          }
-      }
-
-      const kvVal = await env.RUBRICS.get(setKey, "text");
-      if (!kvVal) {
-           return new Response(JSON.stringify({ error: `Rubric set '${setKey}' not found in KV.` }), { status: 404, headers });
-      }
-      const allRubrics = JSON.parse(kvVal);
-
-      const assessments = [];
-      for (const skillInfo of skills) {
-          const { skill: skillName, score: rating } = skillInfo;
-          const resolved = resolveSkill(allRubrics, skillName);
-          if (!resolved || !resolved.rubricData) {
-              console.log(`[COACH] Could not resolve rubric for skill: ${skillName}`);
-              continue;
-          }
-          const { rubricData } = resolved;
-
-          // Create the new, simplified prompt
-          const coachUserPrompt = buildSimplifiedCoachingPrompt(skillName, rating, rubricData, normTranscript);
-
-          const coachResp = await chatOpenRouter(env, {
-              model: WRITER_MODEL,
-              temperature: 0.2,
-              max_tokens: 4096,
-              response_format: { type: "json_object" },
-              messages: [
-                  { role: "system", content: OR_SYSTEM_COACH },
-                  { role: "user", content: coachUserPrompt }
-              ],
-          }, { hint: "coach" });
-
-          let coachingResult = { strengths: [], improvements: [], coaching_tips: [] };
-          try {
-              coachingResult = JSON.parse(coachResp.content);
-          } catch (e) {
-              console.error(`[COACH] Failed to parse coaching response for ${skillName}:`, e);
-              // Add a placeholder on failure
-              coachingResult.error = "Failed to generate coaching feedback from model.";
-          }
-
-          assessments.push({
-              skill: skillName,
-              rating: rating,
-              ...coachingResult
-          });
-      }
-
-      const responsePayload = {
-          assessments,
-          meta: {
-              run_id: crypto.randomUUID(),
-              duration_ms: Date.now() - t0,
-              assess_mode: "coaching_only_simplified",
-              kv_hit: false
-          }
-      };
-
-      if (env.ASSESS_CACHE) {
-          await kvPutJSON(env.ASSESS_CACHE, kvKey, responsePayload, KV_TTL_SECS, CACHE_VERSION);
-      }
-
-      return new Response(JSON.stringify(responsePayload), { headers });
-
-  } catch (error) {
-      console.error("handleCoachingFeedback error:", error);
-      return new Response(JSON.stringify({ error: String(error?.message || error) }), { status: 500, headers });
-  }
-}
-
-// --- FULL ASSESSMENT HANDLER ---
-async function handleFullAssessment(request, env) {
-  const url = new URL(request.url);
-  const headers = { "Content-Type": "application/json; charset=utf-8" };
-
-  // -------- Optional Bearer auth ----------
-  const requireAuth =
-    String(env.REQUIRE_AUTH || "").toLowerCase() === "true" ||
-    String(env.REQUIRE_AUTH || "").trim() === "1";
-  const serviceToken = env.SERVICE_TOKEN || "";
-  function isAuthorized(req) {
-    if (!requireAuth) return true;
-    const authHeader = req.headers.get("Authorization") || "";
-    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-    return !!token && token === serviceToken;
+  if (!transcript || !Array.isArray(skills) || skills.length === 0) {
+      return new Response(JSON.stringify({ error: "Missing 'transcript' or 'skills' array." }), { status: 400, headers });
   }
 
-  const DEBUG_PROMPT_FLAG =
-    url.searchParams.get("debug_prompt") === "1" ||
-    String(env.DEBUG_PROMPT || "").trim() === "1";
-  function dlog(...args) { if (DEBUG_PROMPT_FLAG) console.log(...args); }
+  const normTranscript = __normalizeTranscriptSimple(transcript);
 
-  // 👇 Read body ONCE, parse, and LOG what arrived
-  let bodyText = "";
-  let body = {};
-  try { bodyText = await request.text(); } catch { bodyText = ""; }
-  try { body = bodyText ? JSON.parse(bodyText) : {}; } catch { body = {}; }
-
-  console.log("[WORKER] /assess incoming", {
-    method: request.method,
-    url: url.toString(),
-    q: Object.fromEntries(url.searchParams.entries()),
-    hdrs: {
-      "content-type": request.headers.get("content-type"),
-      "x-seller-id": request.headers.get("x-seller-id")
-    },
-    // what the extension actually sent:
-    payload: {
-      sellerId: body.sellerId,
-      skills: body.skills,
-      transcriptLen: typeof body.transcript === "string" ? body.transcript.length : 0
-    }
-  });
-
-  const t0 = Date.now();
-  const timing = {
-    index_ms: 0,
-    index_segments: 0,
-    assess_calls: [],
-    assess_ms_total: 0,
-    prompt_bytes_total: 0,
-  };
-
-  try {
-    const GEMINI_API_KEY = env.GEMINI_API_KEY;
-    if (!GEMINI_API_KEY) {
-      return new Response(JSON.stringify({ error: "API key not configured in Cloudflare secrets." }), { status: 500, headers });
-    }
-
-    // ===== Tunables =====
-    const INDEX_MODEL  = (env.INDEX_MODEL  || "gemini-2.5-pro").trim();
-    const ASSESS_MODE  = (env.ASSESS_MODE  || "parallel").toLowerCase();
-
-    const MAX_CONCURRENCY   = num(env.MAX_CONCURRENCY, 4);
-    const MAX_RUBRICS_BYTES = num(env.MAX_RUBRICS_BYTES, 1_000_000);
-    const MAX_SKILLS_CAP    = num(env.MAX_SKILLS_CAP, 50);
-
-    const MIN_QUOTES_PER_POSITIVE_PASS   = num(env.MIN_QUOTES_PER_POSITIVE_PASS, 1);
-    const MIN_QUOTES_PER_HIGH_LEVEL_PASS = num(env.MIN_QUOTES_PER_HIGH_LEVEL_PASS, 1);
-    const HIGH_LEVEL_START               = num(env.HIGH_LEVEL_START, 4);
-    
-    const NGRAM_N            = num(env.NGRAM_N, 3);
-    const NGRAM_THRESHOLD    = num(env.NGRAM_THRESHOLD, 0.9);
-   
-    const REQUIRE_DISTINCT_EVIDENCE       = bool(env.REQUIRE_DISTINCT_EVIDENCE, false);
-    const MAX_EVIDENCE_REUSE              = num(env.MAX_EVIDENCE_REUSE, 2);
-    const ENFORCE_MAX_WORDS_IN_EVIDENCE   = bool(env.ENFORCE_MAX_WORDS_IN_EVIDENCE, false);
-
-    const MAX_SELLER_QUOTES = num(env.MAX_SELLER_QUOTES, 200);
-    const MAX_CUSTOMER_CUES = num(env.MAX_CUSTOMER_CUES, 50);
-    const MAX_QUOTE_WORDS   = num(env.MAX_QUOTE_WORDS, 150);
-
-    const INDEX_SEGMENT_CHARS     = num(env.INDEX_SEGMENT_CHARS, 3000);
-    const INDEX_SEGMENT_MAX       = num(env.INDEX_SEGMENT_MAX, 10);
-    const INDEX_SPLIT_MAX_DEPTH   = num(env.INDEX_SPLIT_MAX_DEPTH, 3);
-    
-    const WHITELIST_MAX     = num(env.WHITELIST_MAX, 300);
-    const BUCKETS_IN_PROMPT = String(env.BUCKETS_IN_PROMPT || "none").toLowerCase();
-    const BUCKET_SAMPLE_N   = num(env.BUCKET_SAMPLE_N, "none");
-
-    const CACHE_VERSION   = String(env.CACHE_VERSION || "1");
-    const KV_TTL_SECS     = num(env.KV_TTL_SECS,   60 * 60 * 24 * 14);
-    const EDGE_TTL_SECS   = num(env.EDGE_TTL_SECS,   60 * 60 * 24 * 7);
-    const WARM_EDGE_CACHE = bool(env.WARM_EDGE_CACHE, true);
-
-    // ===== Parse already-parsed body =====
-    let {
-      transcript,
-      rubrics,          // ignored unless rubrics_url explicitly used
-      rubrics_url,
-      skills,
-      sellerId,
-      internalSpeakers
-    } = body || {};
-
-    // tolerate string[], Set<string>, or undefined
-    /** @type {string[]} */
-    const internalArr = Array.isArray(internalSpeakers)
-    ? internalSpeakers.map(String)
-    : (internalSpeakers && typeof internalSpeakers[Symbol.iterator] === 'function'
-        ? Array.from(internalSpeakers, s => String(s))
-        : []);
-
-    if (!transcript && typeof body?.transcript === "string") transcript = body.transcript;
-
-    const rubricSetParam = url.searchParams.get("rubric_set");
-    const skillsParamQS  = url.searchParams.get("skills");
-    const competencyQS   = url.searchParams.get("competency");
-
-    if (!Array.isArray(skills) && typeof skillsParamQS === "string") {
-      skills = skillsParamQS.split(",").map((s) => s.trim()).filter(Boolean);
-    }
-
-    // ---- ALWAYS prefer server-side rubric sources ----
-    // 1) explicit URL (if provided) -> 2) KV (rubric_set or default) -> error
-    let rubric_source = null;
-    let loadedRubrics = null;
-
-    if (rubrics_url) {
-      if (!/^https:\/\/.+/i.test(rubrics_url)) {
-        return new Response(JSON.stringify({ error: "rubrics_url must be HTTPS" }), { status: 400, headers });
+  const cacheKeyInput = stable({ v: CACHE_VERSION, transcript: normTranscript, skills });
+  const cacheKeyHash = await sha256Hex(cacheKeyInput);
+  const kvKey = `v${CACHE_VERSION}:coach:${cacheKeyHash}`;
+  if (env.ASSESS_CACHE) {
+      const cached = await kvGetJSON(env.ASSESS_CACHE, kvKey);
+      if (cached) {
+          cached.meta = { ...(cached.meta || {}), kv_hit: true, duration_ms: Date.now() - t0 };
+          return new Response(JSON.stringify(cached), { headers });
       }
-      const rubricsRes = await fetch(rubrics_url, { method: "GET" });
-      const ct = (rubricsRes.headers.get("content-type") || "").toLowerCase();
-      if (!ct.includes("application/json")) {
-        return new Response(JSON.stringify({ error: "rubrics_url did not return JSON" }), { status: 400, headers });
-      }
-      const rubricsText = await rubricsRes.text();
-      if (rubricsText.length > MAX_RUBRICS_BYTES) {
-        return new Response(JSON.stringify({ error: `rubrics JSON too large (>${MAX_RUBRICS_BYTES} bytes)` }), { status: 400, headers });
-      }
-      try { loadedRubrics = JSON.parse(rubricsText); }
-      catch { return new Response(JSON.stringify({ error: "Invalid JSON from rubrics_url" }), { status: 400, headers }); }
-      rubric_source = "url";
-    } else {
-      // Pull from KV (default when no URL)
-      if (!env.RUBRICS) {
-        return new Response(JSON.stringify({ error: "KV binding RUBRICS missing" }), { status: 500, headers });
-      }
-      const setKey = rubricSetParam || env.DEFAULT_RUBRIC_SET || "rubrics:v1";
-      let kvVal = await env.RUBRICS.get(setKey, "text");
-
-      // alias support: if the KV value is itself a KV key
-      if (kvVal && /^rubrics:/.test(kvVal.trim())) {
-        const aliasVal = await env.RUBRICS.get(kvVal.trim(), "text");
-        if (aliasVal) kvVal = aliasVal;
-      }
-
-      if (!kvVal) {
-        return new Response(JSON.stringify({
-          error: "rubric_set not found in KV",
-          rubric_set: setKey
-        }), { status: 404, headers });
-      }
-      if (kvVal.length > MAX_RUBRICS_BYTES) {
-        return new Response(JSON.stringify({ error: `KV rubrics too large (>${MAX_RUBRICS_BYTES} bytes)` }), { status: 400, headers });
-      }
-      try { loadedRubrics = JSON.parse(kvVal); }
-      catch {
-        return new Response(JSON.stringify({
-          error: "Invalid JSON in KV rubric_set",
-          rubric_set: setKey
-        }), { status: 400, headers });
-      }
-      rubric_source = `kv:${setKey}`;
-    }
-
-    // If a competency filter is present, narrow to that competency (structure preserved)
-    if (competencyQS) {
-      const comp = loadedRubrics?.[competencyQS];
-      if (!comp?.skills) {
-        return new Response(JSON.stringify({ error: `Unknown competency: ${competencyQS}` }), { status: 400, headers });
-      }
-      loadedRubrics = { [competencyQS]: { skills: comp.skills } };
-    }
-
-    // Final assign: use server-side rubrics only
-    rubrics = loadedRubrics;
-
-    if (!transcript || !rubrics) {
-      return new Response(JSON.stringify({ error: "Missing 'transcript' or could not load 'rubrics'." }), { status: 400, headers });
-    }
-    
-    const googleURL = (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
-    const edgeCache = caches.default;
-    function edgeKey(kind, hash) { return new Request(`https://cache.internal/${kind}/${hash}`, { method: "GET" }); }
-    async function edgePutJSON(reqKey, json) {
-      if (!WARM_EDGE_CACHE) return;
-      const res = new Response(JSON.stringify(json), {
-        headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": `public, max-age=${EDGE_TTL_SECS}, s-maxage=${EDGE_TTL_SECS}`,
-          "X-Cached-By": "sales-coach-worker",
-        },
-      });
-      await edgeCache.put(reqKey, res);
-    }
-
-    // -------- Optional admin KV ----------
-  const adminEnabled =
-  String(env.ADMIN_API || "").toLowerCase() === "true" ||
-  String(env.ADMIN_API || "").trim() === "1";
-
-if (request.method === "POST" && url.pathname.startsWith("/admin/kv/")) {
-  if (!adminEnabled) return new Response(JSON.stringify({ error: "Admin API disabled" }), { status: 404, headers });
-  if (!isAuthorized(request)) return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers });
-
-  //const body = await request.json().catch(() => ({}));
-  const ns = env.ASSESS_CACHE;
-  if (!ns) return new Response(JSON.stringify({ error: "KV binding ASSESS_CACHE missing" }), { status: 500, headers });
-
-  if (url.pathname === "/admin/kv/purge") {
-    const { kind, hash, cache_version } = body || {};
-    const v = String(cache_version ?? env.CACHE_VERSION ?? "1");
-    if (!kind || !hash) return new Response(JSON.stringify({ error: "kind and hash required" }), { status: 400, headers });
-    const key = `v${v}:${kind}:${hash}`;
-    await ns.delete(key);
-    return new Response(JSON.stringify({ ok: true, deleted: key }), { headers });
   }
 
-  if (url.pathname === "/admin/kv/list") {
-    const prefix = url.searchParams.get("prefix") || "";
-    const out = await ns.list({ prefix, limit: 1000 });
-    return new Response(JSON.stringify(out), { headers });
+  const rubricsText = await env.RUBRICS.get(env.DEFAULT_RUBRIC_SET || "rubrics:v1", "text");
+  if (!rubricsText) throw new Error("Could not load rubrics from KV.");
+  const allRubrics = JSON.parse(rubricsText);
+  const assessments = [];
+
+  for (const skillInfo of skills) {
+      const { skill: skillName, score: rating } = skillInfo;
+      const resolved = resolveSkill(allRubrics, skillName);
+      if (!resolved || !resolved.rubricData) continue;
+
+      const coachUserPrompt = buildSimplifiedCoachingPrompt(skillName, rating, resolved.rubricData, normTranscript);
+      const coachResp = await chatOpenRouter(env, {
+          model: env.COACH_MODEL || "openai/gpt-4o-mini",
+          temperature: 0.2, max_tokens: 2048, response_format: { type: "json_object" },
+          messages: [{ role: "system", content: OR_SYSTEM_COACH }, { role: "user", content: coachUserPrompt }]
+      }, { hint: "coach" });
+
+      let coachingResult = { strengths: [], improvements: [], coaching_tips: [] };
+      try { coachingResult = JSON.parse(coachResp.content); }
+      catch (e) { console.error(`Coach parse failed for ${skillName}: ${e.message}`); }
+
+      assessments.push({ skill: skillName, rating, ...coachingResult });
   }
 
-  return new Response(JSON.stringify({ error: "Unknown admin route" }), { status: 404, headers });
-}
-
-    // ---------- helpers used later ----------
-    function normalizeTranscript(s) {
-      if (!s) return "";
-      let t = String(s);
-      t = t.replace(/\t/g, " ").replace(/[ \u00A0]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
-      return t;
-    }
-    function sortRubricDeterministically(rubricData) {
-      if (!rubricData || !Array.isArray(rubricData.levels)) { return rubricData; }
-      const sortedRubric = JSON.parse(JSON.stringify(rubricData));
-      sortedRubric.levels.sort((a, b) => (a.level || 0) - (b.level || 0));
-      for (const level of sortedRubric.levels) {
-        if (Array.isArray(level.checks)) {
-          level.checks.sort((a, b) => String(a.characteristic).localeCompare(String(b.characteristic)));
-        }
-      }
-      return sortedRubric;
-    }
-    function isCustomerEvidenceRequired(characteristicText) {
-      const lowerText = String(characteristicText || '').toLowerCase();
-      if (!lowerText) return false;
-      const keywords = ['prompting', 'prompted', 'guidance', 'support', 'feedback', 'objections', 'cues', 'led by'];
-      return keywords.some(keyword => lowerText.includes(keyword));
-    }
-    function isCharacteristicObservable(characteristicText) {
-      const NON_OBSERVABLE_KEYWORDS = ['document', 'documents', 'documented', 'documentation', 'write', 'writes', 'written', 'update', 'updates', 'updated', 'schedule', 'schedules', 'scheduled', 'send', 'sends', 'sent', 'log', 'logs', 'logged', 'report', 'reports', 'reported', 'crm', 'email', 'calendar', 'invite', 'follow-up', 'follow up'];
-      const lowerText = String(characteristicText || '').toLowerCase();
-      if (!lowerText) return true;
-      return !NON_OBSERVABLE_KEYWORDS.some(keyword => {
-        const regex = new RegExp(`\\b${keyword}\\b`);
-        return regex.test(lowerText);
-      });
-    }
-    function applyObservableFlags(modelChecks, originalRubric) {
-      const characteristicMap = new Map();
-      for (const level of originalRubric?.levels || []) {
-        for (const check of level?.checks || []) {
-          const characteristic = String(check.characteristic || '').trim();
-          if (!characteristic) continue;
-          let isObservable;
-          if (typeof check.observable === 'boolean') {
-            isObservable = check.observable;
-          } else {
-            isObservable = isCharacteristicObservable(characteristic);
-          }
-          characteristicMap.set(characteristic, isObservable);
-        }
-      }
-      const processedChecks = JSON.parse(JSON.stringify(modelChecks));
-      for (const level of processedChecks || []) {
-        for (const check of level?.checks || []) {
-          const characteristic = String(check.characteristic || '').trim();
-          check.observable = characteristicMap.get(characteristic) ?? true;
-        }
-      }
-      return processedChecks;
-    }
-    function normalizeChecks(levels) {
-      for (const lvl of levels || []) {
-        for (const c of (lvl.checks || [])) {
-          if (typeof c.observable !== "boolean") c.observable = true;
-        }
-      }
-      return levels;
-    }
-    function correctInconsistentMetStatus(levels) {
-      const corrected = JSON.parse(JSON.stringify(levels));
-      for (const level of corrected) {
-        if (!level.checks) continue;
-        for (const check of level.checks) {
-          const hasEvidence = check.evidence && check.evidence.length > 0;
-          if (check.met === true && !hasEvidence && (check?.observable ?? true)) {
-            check.met = false;
-            check.reason = `[AUTO-CORRECTED] 'met' was true but no evidence was found. Original reason: ${check.reason}`;
-          }
-        }
-      }
-      return corrected;
-    }
-    function normalizePolarity(levels) {
-      const NEG_PATTERNS = [/^does not\b/i, /^fails to\b/i, /^provides an incomplete\b/i, /^rarely\b/i];
-      const out = JSON.parse(JSON.stringify(levels || []));
-      for (const lvl of out) {
-        for (const check of (lvl.checks || [])) {
-          const p = String(check.polarity || "").toLowerCase().trim();
-          if (p === "positive" || p === "negative" || p === "limitation") {
-            check.polarity = p;
-            continue;
-          }
-          const ch = String(check.characteristic || "");
-          check.polarity = NEG_PATTERNS.some(rx => rx.test(ch)) ? "negative" : "positive";
-        }
-      }
-      return out;
-    }
-    function levelRequiredQuotes(lvlNum) {
-      return (lvlNum >= HIGH_LEVEL_START) ? MIN_QUOTES_PER_HIGH_LEVEL_PASS : MIN_QUOTES_PER_POSITIVE_PASS;
-    }
-    function didPassLevelPositives(lvl) {
-      if (!lvl || !Array.isArray(lvl.checks)) return true;
-      const rq = levelRequiredQuotes(lvl.level || 0);
-      const positives = lvl.checks.filter(
-        c => (c.polarity || "positive") === "positive" && (c?.observable ?? true) === true
-      );
-      const allPositivesMet = positives.length === 0 || positives.every(c => c.met === true && Array.isArray(c.evidence) && c.evidence.length >= rq);
-      const limitations = lvl.checks.filter(
-        c => c.polarity === "limitation" && (c?.observable ?? true) === true
-      );
-      const allLimitationsMet = limitations.every(c => c.met === true);
-      return allPositivesMet && allLimitationsMet;
-    }
-
-    function computeHighestDemonstrated(levels) {
-      if (!Array.isArray(levels) || levels.length === 0) return 1;
-      const normalized = normalizeChecks(levels);
-      const sorted = [...normalized].sort((a,b) => (a.level||0)-(b.level||0));
-      let highest = 0;
-      for (const lvl of sorted) {
-        // This version does NOT break; it finds the highest level passed anywhere.
-        if (didPassLevelPositives(lvl)) highest = Math.max(highest, lvl.level || 0);
-      }
-      return highest > 0 ? highest : 1;
-    }
-
-    function enforceNegativeGuard(levels) {
-      const out = JSON.parse(JSON.stringify(levels));
-      for (const lvl of out || []) {
-        for (const check of (lvl.checks || [])) {
-          if ((check.polarity || "positive") !== "negative") continue;
-          const hasEvidence = Array.isArray(check.evidence) && check.evidence.length > 0;
-          if (check.met === true && hasEvidence) {
-            check.met = false;
-            check.evidence = [];
-            check.reason = `[AUTO-CORRECTED] Negative check cannot be 'met' with verbatim evidence. Set to met:false and removed evidence. ${check.reason || ""}`.trim();
-          }
-        }
-      }
-      return out;
-    }
-
-    function normKey(s) {
-      return String(s || "")
-        .toLowerCase()
-        .replace(/\s+/g, " ")
-        .trim();
-    }
-    
-    function buildSkillMap(rubricsObj) {
-      const map = new Map();
-      for (const comp in (rubricsObj || {})) {
-        const skillsObj = rubricsObj[comp]?.skills || {};
-        for (const skillName in skillsObj) {
-          map.set(normKey(skillName), { skillName, competency: comp, rubricData: skillsObj[skillName] });
-        }
-      }
-      return map;
-    }
-    
-    function resolveSkill(rubricsObj, requestedName) {
-      const m = buildSkillMap(rubricsObj);
-      return m.get(normKey(requestedName)) || null;
-    }    
-
-    function extractFnCall(resp) {
-      const cands = resp?.candidates || [];
-      for (const c of cands) {
-        const parts = c?.content?.parts || [];
-        for (const p of parts) {
-          if (p?.functionCall?.name && p?.functionCall?.args) return p.functionCall;
-          if (typeof p?.text === "string") {
-            try {
-              const parsed = JSON.parse(p.text);
-              if (parsed && (parsed.level_checks || parsed.levelChecks)) {
-                return { name: "extract_analysis", args: { level_checks: parsed.level_checks || parsed.levelChecks } };
-              }
-            } catch {}
-          }
-        }
-      }
-      return null;
-    }
-
-    // IMPORTANT: we missed this earlier; add it back.
-    function sanitizeEvidenceAgainstIndex(skillLevels, sellerQuotesSet, transcriptText, allowlist) {
-      const rawTranscript  = transcriptText || "";
-      const normTranscript = normalize(rawTranscript);
-      const sellerQuotes = new Set(Array.from(sellerQuotesSet || new Set()).map(normalize).filter(Boolean));
-      const allowSet = (() => {
-        if (!allowlist) return null;
-        const arr = allowlist instanceof Set ? Array.from(allowlist) : Array.isArray(allowlist) ? allowlist : [];
-        const s = new Set(arr.map(normalize).filter(Boolean));
-        return s.size ? s : null;
-      })();
-      const getMinForLevel = (level) => (Number(level) >= HIGH_LEVEL_START ? MIN_QUOTES_PER_HIGH_LEVEL_PASS : MIN_QUOTES_PER_POSITIVE_PASS);
-      let totalBefore = 0, totalAfter = 0;
-
-      const STRICT_MIN_CHARS = num(env.MIN_EVIDENCE_CHARS, 20);
-      const ALLOW_FUZZY = bool(env.ALLOW_FUZZY_EVIDENCE, false);
-      const TRUNCATED_END_RX = /\b(?:wouldn|didn|couldn|shouldn|aren|isn|wasn|weren|don|doesn|haven|hasn|hadn|won|can)\b$/i;
-      
-      //const rawTranscript = String(transcriptText || "");
-      const normTranscriptLoose = rawTranscript // normalize quotes/spaces but keep punctuation
-        .replace(/[\u2018\u2019]/g, "'")
-        .replace(/[\u201c\u201d]/g, '"')
-        .replace(/[ \u00A0]{2,}/g, " ");
-      
-      function isExactSubstringWithBoundaries(needle, haystack) {
-        const i = haystack.toLowerCase().indexOf(needle.toLowerCase());
-        if (i < 0) return false;
-        const j = i + needle.length;
-        const leftOk  = i === 0 || /[\s"'>)\].,!?]/.test(haystack[i - 1]);
-        const rightOk = j === haystack.length || /[\s"'<\[(.,!?]/.test(haystack[j]);
-        return leftOk && rightOk;
-      }
-      
-      const allowSellerExact = new Set(
-        Array.from(sellerQuotes || []).map(s => s)
-      );
-      
-      const hasQuote = (q) => {
-        if (!q || typeof q !== "string") return false;
-        const trimmed = q.replace(/\s+/g, " ").trim();
-        if (!trimmed || trimmed.length < STRICT_MIN_CHARS) return false;
-        if (TRUNCATED_END_RX.test(trimmed)) return false;
-      
-        // exact substring in transcript with word boundaries
-        if (isExactSubstringWithBoundaries(trimmed, normTranscriptLoose)) return true;
-      
-        // exact substring of any *allowed* seller quote (already normalized per allowlist)
-        for (const s of allowSellerExact) {
-          if (isExactSubstringWithBoundaries(trimmed, s)) return true;
-        }
-      
-        // Fuzzy paths are OFF by default
-        if (ALLOW_FUZZY) {
-          const n = normalize(trimmed);
-          if (n.length > 40 && ngramContainment(n, normTranscript, NGRAM_N) >= NGRAM_THRESHOLD) return true;
-        }
-        return false;
-      };
-
-      for (const lvl of (skillLevels || [])) {
-        const MIN = getMinForLevel(Number(lvl.level) || 0);
-        const reuseCounter = new Map();
-        for (const check of (lvl.checks || [])) {
-          const ev = Array.isArray(check.evidence) ? check.evidence : [];
-          totalBefore += ev.length;
-          const kept = ev.map(normalize).filter(hasQuote);
-          const dedupFinal = [];
-          for (const q of kept) {
-            const used = reuseCounter.get(q) || 0;
-            if (used < MAX_EVIDENCE_REUSE) {
-              reuseCounter.set(q, used + 1);
-              dedupFinal.push(q);
-            }
-          }
-          check.evidence = dedupFinal;
-          totalAfter += dedupFinal.length;
-          const isPositive = (check.polarity || "positive") === "positive" && (check?.observable ?? true) === true;
-          if (isPositive && check.met === true && check.evidence.length < MIN) check.met = false;
-        }
-      }
-      if (REQUIRE_DISTINCT_EVIDENCE) {
-        const used = new Set();
-        for (const lvl of (skillLevels || [])) {
-          for (const check of (lvl.checks || [])) {
-            const isPositive = (check.polarity || "positive") === "positive" && (check?.observable ?? true) === true;
-            if (!isPositive) continue;
-            let uniqueFound = false;
-            for (const q of (check.evidence || [])) {
-              if (!used.has(q)) { used.add(q); uniqueFound = true; break; }
-            }
-            if (check.met === true && !uniqueFound) check.met = false;
-          }
-        }
-      }
-      try {
-        const loss = totalBefore ? 1 - (totalAfter / totalBefore) : 1;
-        skillLevels._debug = Object.assign({}, skillLevels._debug, { evidenceLossRatioPostSanitize: +loss.toFixed(3) });
-      } catch {}
-      return correctInconsistentMetStatus(skillLevels);
-
-      function normalize(s) { return String(s || "").toLowerCase().replace(/[\u2018\u2019]/g, "'").replace(/[\u201c\u201d]/g, '"').replace(/[^a-z0-9\s\?]/g, " ").replace(/\s+/g, " ").trim(); }
-      function ngramContainment(q, corpus, n) { const toksQ = q.split(" ").filter(Boolean); if (toksQ.length < n) return 0; const grams = new Set(); for (let i = 0; i <= toksQ.length - n; i++) grams.add(toksQ.slice(i, i + n).join(" ")); let hit = 0; for (const g of grams) if (corpus.includes(g)) hit++; return grams.size ? hit / grams.size : 0; }
-    }
-
-    // ===== Prompt builders =====
-    function buildIndexPrompt(transcript) {
-      return `
-      You are an objective assistant. Your primary goal is to build a SELLER-CENTRIC evidence index from the provided transcript.
-      **Seller Identification Logic (in order of priority):**
-      1.  **BEHAVIORAL ANALYSIS (Primary Method):** Your primary method for identifying the seller is by analyzing their role. The **SELLER** is the speaker who consistently asks discovery questions, introduces products or solutions, and guides the conversation. The **CUSTOMER** is the one primarily answering questions and describing their challenges.
-      2.  **NAMES AS CONFIRMATION (Secondary Method):** Use names mentioned in the dialogue only to confirm your behavioral analysis. A single name mentioned, especially if it's a mistake, should NOT override the behavioral analysis.
-      **Your Final Answer:**
-      - After your analysis, use the speaker's original label (e.g., 'User', 'Speaker 1') as the final seller_label.
-      Output (must call index_transcript). Return ONLY the function call with:
-      - seller_label: The final, correct label of the seller (e.g., 'User').
-      - seller_quotes[]: Max ${MAX_SELLER_QUOTES} quotes from the seller (<= ${MAX_QUOTE_WORDS} words each).
-      - customer_cues[]: Max ${MAX_CUSTOMER_CUES} quotes from the customer (<= ${MAX_QUOTE_WORDS} words each).
-      - evidence_buckets: Group SELLER quotes by generic behavior.
-      TRANSCRIPT
-      ---
-      ${transcript}
-      ---`;
-    }
-    
-    function buildDirectedIndexPrompt(transcript, sellerLabel, internalSpeakers = []) {
-      // normalize & collect speakers present in the transcript
-      const lines = String(transcript || "").split("\n");
-      const speakers = new Set(
-        lines
-          .map(l => l.split(":")[0]?.trim())
-          .filter(Boolean)
-      );
-    
-      // normalize internal list
-      const internalSet = (internalSpeakers instanceof Set)
-        ? new Set([...internalSpeakers].map(s => String(s).toLowerCase().trim()))
-        : new Set((internalSpeakers || []).map(s => String(s).toLowerCase().trim()));
-    
-      // compute customer speakers = everyone except seller + internal
-      const customerSpeakers = [...speakers].filter(sp => {
-        const lc = String(sp).toLowerCase().trim();
-        const isSeller = sp === sellerLabel;
-        const isInternal = internalSet.has(lc);
-        return !isSeller && !isInternal;
-      });
-    
-      // helpful, but optional—keeps prompt compact
-      const customerListText = customerSpeakers.length
-        ? `The CUSTOMER speakers are: ${customerSpeakers.map(s => `"${s}"`).join(", ")}.`
-        : `Any speaker that is not the SELLER and not in the internal list is a CUSTOMER.`
-    
-      return `
-    You are an objective assistant. Your goal is to extract quotes from the provided transcript.
-    
-    CRITICAL INSTRUCTIONS:
-    - The SELLER has been pre-identified. The seller's label is "${sellerLabel}".
-    - Treat **all non-seller, non-internal speakers** as CUSTOMERS.
-    - ${customerListText}
-    - Do NOT infer or re-identify the seller. Use the provided seller label only.
-    - Ignore internal/colleague/host/facilitator turns for customer evidence.
-    
-    OUTPUT (must call index_transcript). Return ONLY the function call with:
-    - seller_label: Use exactly "${sellerLabel}".
-    - seller_quotes[]: Up to ${MAX_SELLER_QUOTES} verbatim quotes spoken by "${sellerLabel}" (<= ${MAX_QUOTE_WORDS} words each).
-    - customer_cues[]: Up to ${MAX_CUSTOMER_CUES} verbatim quotes spoken by ANY of the CUSTOMER speakers (<= ${MAX_QUOTE_WORDS} words each).
-    - evidence_buckets: Group ONLY the SELLER'S quotes by behavior buckets.
-    
-    REFERENCE:
-    - Internal speakers (exclude from customer cues): ${[...internalSet].join(", ") || "(none provided)"}
-    
-    TRANSCRIPT
-    ---
-    ${transcript}
-    ---`;
-    }
-
-    function buildAnalysisPrompt(skillName, rubricData, index, whitelist) {
-    const sortedRubric = sortRubricDeterministically(rubricData);
-
-    // Identify characteristics that need the customer evidence exception rule
-    const customerEvidenceChecks = new Set();
-    for (const level of rubricData?.levels || []) {
-        for (const check of level?.checks || []) {
-            if (isCustomerEvidenceRequired(check.characteristic)) {
-                customerEvidenceChecks.add(String(check.characteristic || '').trim());
-            }
-        }
-    }
-
-    // Dynamically create the exception rule text for the prompt
-    const exceptionRuleText = customerEvidenceChecks.size > 0 
-        ? `**Evidence Rule 2 (Exception):** For characteristics describing the seller requiring "prompting," "guidance," or reacting to "feedback" or "objections," you MUST look for evidence in the \`indexed_customer_cues\`. For this skill, this rule applies to: ${stable(Array.from(customerEvidenceChecks))}`
-        : `**Evidence Rule 2 (No Exceptions):** For this skill, all evidence must come from the seller's quotes. The \`indexed_customer_cues\` are for context only.`;
-
-    return `
-You are an OBJECTIVE AI Analyst. Your only function is to compare verbatim quotes from a transcript to a rubric. You must act as a hyper-literal and demanding grader.
-
-**CORE DIRECTIVES:**
-
-1.  **PRINCIPLE OF EVIDENCE:** The evidence MUST be a direct, self-evident demonstration of the characteristic described in the rubric.
-    - **Directness:** The quote itself must be the evidence. Do not infer intent or give credit for trying.
-    - **Completeness & Context:** A characteristic can be met by a single quote OR by a logical sequence of related quotes. For example, if a characteristic is "Proactively probes for clarification," a series of questions that dig deeper into a topic collectively meets the criteria. You must, however, cite the most representative quotes from that sequence.
-
-2.  **THE FAIR INTERPRETATION RULE:** While you must be literal, you must also be fair. Acknowledge the logical flow of conversation. Do not penalize a seller for asking multiple questions to explore a topic instead of one perfect question. If the seller's questions logically lead to the uncovering of a challenge, that counts as evidence.
-
-3.  **ABSENCE OF EVIDENCE IS FAILURE:** If you cannot find verbatim evidence that directly and completely matches the characteristic, it is **NOT MET**.
-
-**ADDITIONAL GUIDANCE:**
-- **Evidence Mandate:** You MUST cite at least one representative quote in the 'evidence' array for EVERY check to support your 'reason', regardless of whether 'met' is true or false.
-- **Observability:** For characteristics mentioning non-observable actions (e.g., "documents challenges"), base your assessment ONLY on the observable parts. If the observable part is met, you may set 'met: true'.
-- **Polarity Logic:**
-    - **Positive:** A desirable skill. Set 'met: true' ONLY if demonstrated according to the Core Directives.
-    - **Limitation:** A characteristic of a developing performance, representing a minimum bar.
-        - **Crucial Rule:** Set 'met: true' if the performance is **the same as OR better than** the limitation. This means the seller has cleared the minimum bar.
-        - Set 'met: false' ONLY if the performance is **worse than** the limitation. This means the seller failed to clear the minimum bar.
-    - **Negative:** A critical flaw. Set 'met: true' ONLY if the seller actively demonstrates this negative behavior.
----
-**EVIDENCE SOURCES AND RULES:**
-
-**Source 1: Seller Quotes**
-indexed_seller_quotes = ${stable(whitelist)}
-
-**Source 2: Customer Cues (Context)**
-indexed_customer_cues = ${stable(index.customer_cues || [])}
-
-**Evidence Rule 1 (Primary):** For most characteristics, you MUST use evidence exclusively from the 'indexed_seller_quotes'.
-**Copy/Paste Requirement:** Every evidence string MUST be an exact copy/paste of a full substring from either 'indexed_seller_quotes' (or from 'indexed_customer_cues' ONLY for the exception checks listed). Do NOT clip words, do NOT add or remove characters. If you cannot find an exact substring, leave 'evidence: []' and set 'met: false'.
-
-${exceptionRuleText}
----
-**TASK:**
-- For EVERY characteristic in EVERY level of the rubric, determine if it was 'met' based on the strict directives above.
-- Return ONLY a function call to 'extract_analysis'. Provide a concise 'reason' and cite the specific verbatim 'evidence'.
----
-**RUBRIC (Skill: ${skillName})**
----
-${stable(sortedRubric)}
----`;
-}
-
-function buildCoachingPrompt(skillName, rating, levelChecks, gatingSummary, improvements) {
-  return `
-  You are an expert AI Sales Coach. The analysis for "${skillName}" has a final rating of ${rating}/5.
-  Use ONLY this analysis (do not re-score):
-  ${stable({ level_checks: levelChecks, gating_summary: gatingSummary, improvements: improvements })}
-
-  YOUR TASK:
-  - Return ONLY JSON via extract_coaching_feedback.
-  - 2-4 strengths (from highest achieved).
-  - 3-5 improvements (based on the pre-filled improvements provided).
-  - For each improvement, you MUST:
-    - Use the provided 'instead_of' quote. **Do not change it.**
-    - The 'try_this' suggestion must be a directional coaching instruction, based strictly on the actual evidence/quote used in 'instead_of'.
-    - You are strictly forbidden from inventing, referencing, or describing any product features, solution capabilities, or benefits that are not explicitly present in the evidence. Do NOT make up or speculate about what the solution can do.
-  - 3-6 actionable coaching tips mapped to the improvements.
-
-  IMPORTANT:
-  - You must only use the quotes that appear in the provided 'improvements' when generating your response.
-  - If the provided 'improvements' list is empty, you MUST return '"improvements": []'
-  - Do not invent, paraphrase, or generalize quotes. Use only what is present.`;
-}
-
-    // ===== Tool schemas (Gemini indexing only) -------
-    const indexingTool = {
-      functionDeclarations: [{
-        name: "index_transcript",
-        description: "Identify the seller and extract seller-only quotes (no paraphrase). Also bucket quotes by generic behavior types. KEEP OUTPUT SMALL.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            seller_label: { type: "STRING" },
-            seller_quotes: { type: "ARRAY", items: { type: "STRING" } },
-            customer_cues: { type: "ARRAY", items: { type: "STRING" } },
-            evidence_buckets: {
-              type: "OBJECT",
-              properties: {
-                ask_probe: { type: "ARRAY", items: { type: "STRING" } },
-                clarify_validate: { type: "ARRAY", items: { type: "STRING" } },
-                summarize_synthesize: { type: "ARRAY", items: { type: "STRING" } },
-                empathize_label: { type: "ARRAY", items: { type: "STRING" } },
-                quantify_measure: { type: "ARRAY", items: { type: "STRING" } },
-                connect_link: { type: "ARRAY", items: { type: "STRING" } },
-                document_commit: { type: "ARRAY", items: { type: "STRING" } },
-                explain_teach: { type: "ARRAY", items: { type: "STRING" } },
-                position_value: { type: "ARRAY", items: { type: "STRING" } },
-                other: { type: "ARRAY", items: { type: "STRING" } },
-              },
-            },
-          },
-          required: ["seller_label", "seller_quotes", "customer_cues", "evidence_buckets"],
-        },
-      }],
-    };
-
-    // ===== Utility: evidence pickers for UI quotes =========================
-    function flattenAllEvidence(levelChecks) {
-      const out = [];
-      for (const lvl of levelChecks || []) {
-        for (const c of (lvl.checks || [])) {
-          const ev = Array.isArray(c.evidence) ? c.evidence : [];
-          for (const q of ev) out.push({ level: lvl.level, name: lvl.name, characteristic: c.characteristic, quote: q, met: !!c.met, polarity: c.polarity || "positive" });
-        }
-      }
-      return out;
-    }
-
-    function flattenAllEvidenceWithMeta(levelChecks, transcript, evidence_buckets) {
-      const out = [];
-      for (const lvl of levelChecks || []) {
-        for (const c of (lvl.checks || [])) {
-          const ev = Array.isArray(c.evidence) ? c.evidence : [];
-          for (const q of ev) {
-            const context = getQuoteContextWindow(transcript, q);
-            const bucket  = getBucketForQuote(q, evidence_buckets);
-            const intent  = inferQuoteIntent(q, context);
-            out.push({
-              level: lvl.level,
-              name: lvl.name,
-              characteristic: c.characteristic,
-              quote: q,
-              met: !!c.met,
-              polarity: c.polarity || "positive",
-              bucket,
-              context,
-              intent
-            });
-          }
-        }
-      }
-      return out;
-    }
-
-   // Preferred buckets per skill name (heuristic, safe defaults)
-const SKILL_BUCKET_HINTS = [
-  { whenNameIncludes: ["listen","active","probe","discovery","question"], buckets: ["ask_probe","clarify_validate","summarize_synthesize","empathize_label"] },
-  { whenNameIncludes: ["summarize","synthesize","recap"],               buckets: ["summarize_synthesize","clarify_validate"] },
-  { whenNameIncludes: ["empathy","label","acknowledge"],                 buckets: ["empathize_label","clarify_validate"] },
-  { whenNameIncludes: ["quantify","measure","metrics"],                  buckets: ["quantify_measure","clarify_validate"] },
-  { whenNameIncludes: ["link","connect"],                                buckets: ["connect_link","summarize_synthesize"] },
-  { whenNameIncludes: ["teach","explain","position","story"],            buckets: ["explain_teach","position_value"] },
-];
-function bucketsForSkillName(skillName) {
-  const s = (skillName || "").toLowerCase();
-  for (const rule of SKILL_BUCKET_HINTS) {
-    if (rule.whenNameIncludes.some(k => s.includes(k))) return rule.buckets;
-  }
-  return ["ask_probe","clarify_validate","summarize_synthesize","empathize_label","connect_link","quantify_measure","explain_teach","position_value","document_commit","other"];
-}
-
-function pickRepresentativeEvidenceForCharacteristic(levelChecks, characteristic, exclude = new Set(), opts = {}) {
-      const { transcript, evidence_buckets, skillName } = opts || {};
-      // 'all' will be empty in the /coach flow, which is the root of the problem.
-      const all = (transcript || evidence_buckets)
-          ? flattenAllEvidenceWithMeta(levelChecks, transcript || "", evidence_buckets || {})
-          : flattenAllEvidence(levelChecks);
-  
-      const preferredBuckets = bucketsForSkillName(skillName);
-  
-      // --- Primary Strategy: Use model-vetted evidence from full assessment first ---
-      // This part works correctly for the /assess endpoint.
-      const best = (all || []).filter(e => {
-          const bucket = /** @type {any} */ (e).bucket;
-          return e.quote && !exclude.has(e.quote) && e.polarity === "positive" && e.met === true && (!bucket || preferredBuckets.includes(bucket));
-      }).sort((a, b) => (b.level || 0) - (a.level || 0));
-      if (best.length) return best[0].quote;
-  
-      const lim = (all || []).filter(e => e.polarity === "limitation" && e.met === true && e.quote && !exclude.has(e.quote))
-          .sort((a, b) => (b.level || 0) - (a.level || 0));
-      if (lim.length) return lim[0].quote;
-  
-      // --- NEW FALLBACK STRATEGY for /coach flow ---
-      // If 'all' is empty (meaning we're in the coach-only flow with no model-vetted evidence),
-      // we pick a relevant quote directly from the heuristic evidence_buckets.
-      if (all.length === 0 && evidence_buckets) {
-          // 1. Try preferred buckets for the skill first.
-          for (const bucketName of preferredBuckets) {
-              const quotesInBucket = evidence_buckets[bucketName] || [];
-              const firstAvailable = quotesInBucket.find(q => q && !exclude.has(q));
-              if (firstAvailable) {
-                  return firstAvailable;
-              }
-          }
-  
-          // 2. If no luck, try all buckets in their deterministic order.
-          for (const bucketName of BUCKET_ORDER) {
-              const quotesInBucket = evidence_buckets[bucketName] || [];
-              const firstAvailable = quotesInBucket.find(q => q && !exclude.has(q));
-              if (firstAvailable) {
-                  return firstAvailable;
-              }
-          }
-      }
-  
-      // Final fallback: any piece of evidence from the original (but likely empty) 'all' array.
-      const any = (all || []).find(e => e.quote && !exclude.has(e.quote));
-      return any ? any.quote : "";
-  }
-
-// (kept name/signature; third arg is optional and safe)
-function backfillImprovementQuotes(improvements, levelChecks, extra) {
-  const used = new Set();
-  return (improvements || []).map(impr => {
-    if (!impr) return impr;
-    const needsQuote = !impr.quote || /seller missed|generic|placeholder/i.test(String(impr.quote));
-    if (needsQuote) {
-      const q = pickRepresentativeEvidenceForCharacteristic(levelChecks, impr.point, used, extra || {});
-      if (q) { impr.quote = q; used.add(q); }
-      else { impr.quote = "The seller changed topic instead of deepening this skill in that moment."; }
-    } else {
-      used.add(impr.quote);
-    }
-    // Optional: attach meta (coach will see this in prompt; harmless if unused)
-    if (extra && extra.transcript) {
-      const ctx = getQuoteContextWindow(extra.transcript, impr.quote);
-      const bucket = getBucketForQuote(impr.quote, extra.evidence_buckets || {});
-      const intent = inferQuoteIntent(impr.quote, ctx);
-      impr._meta = { context: ctx, bucket, intent }; // input-only; doesn't affect tool parsing
-    }
-    return impr;
-  });
-}
-
-
-    // ===== Gemini indexing only =====
-    async function callGeminiIndex(apiKey, transcriptPart, sellerId = null, internalSpeakers = []) {
-      let prompt;
-      const hasAgentUserLabels = transcriptPart.includes("Agent:") && transcriptPart.includes("User:");
-      if (sellerId) {
-        prompt = buildDirectedIndexPrompt(transcriptPart, sellerId, internalSpeakers);
-      } else if (hasAgentUserLabels) {
-        prompt = buildDirectedIndexPrompt(transcriptPart, 'User', internalSpeakers);
-      } else {
-        prompt = buildIndexPrompt(transcriptPart);
-      }
-      const requestBody = {
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        tools: [indexingTool],
-        toolConfig: { functionCallingConfig: { mode: "ANY"} },
-        generationConfig: {
-          temperature: 0,
-          topK: 1,
-          topP: 0,
-          candidateCount: 1
-        },
-        safetySettings: [
-          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-        ],
-      };
-      const result = await withRetry(
-        () => fetchJSON(googleURL(INDEX_MODEL), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(requestBody)
-        }),
-        { retries: num(env.INDEX_RETRY_MAX, 3), baseMs: num(env.INDEX_RETRY_BASE_MS, 800) }
-      );
-      const call = extractFnCall(result);
-      if (!(call && call.args)) {
-        const finishReason = result?.candidates?.[0]?.finishReason || "No reason provided.";
-        throw new Error("Transcript indexing failed. Reason: " + finishReason);
-      }
-      return call.args;
-    }
-
-    function mergeIndexes(list, maxSeller, maxCues, preferredSellerLabel) {
-      // Always prefer the seller the client told us to use
-      const sellerLabel = preferredSellerLabel || (
-      list.some(idx => idx?.seller_label === 'User') ? 'User'
-      : (list.find(idx => idx?.seller_label)?.seller_label || 'Seller')
-      );
-      
-      const allSellerQuotes = new Set();
-      const allCustomerCues = new Set();
-      const allBucketedEvidence = {};
-      BUCKET_ORDER.forEach(k => allBucketedEvidence[k] = new Set());
-      for (const idx of list) {
-        if (!idx || !idx.seller_label) continue;
-        // If a sub-index labeled the *other* speaker as seller, swap roles
-      const isAligned = idx.seller_label === sellerLabel;
-      const quotesToAdd = {
-        seller: isAligned ? idx.seller_quotes : idx.customer_cues,
-        customer: isAligned ? idx.customer_cues : idx.seller_quotes,
-      };
-        (quotesToAdd.seller || []).forEach(q => allSellerQuotes.add(q));
-        (quotesToAdd.customer || []).forEach(c => allCustomerCues.add(c));
-        if (idx.evidence_buckets) {
-          for (const k in idx.evidence_buckets) {
-            if (allBucketedEvidence[k]) {
-              (idx.evidence_buckets[k] || []).forEach(q => allBucketedEvidence[k].add(q));
-            }
-          }
-        }
-      }
-      const out = {
-        seller_label: sellerLabel,
-        seller_quotes: sortQuotesDeterministic([...allSellerQuotes]).slice(0, maxSeller),
-        customer_cues: sortQuotesDeterministic([...allCustomerCues]).slice(0, maxCues),
-        evidence_buckets: {}
-      };
-      const finalSellerQuotesSet = new Set(out.seller_quotes);
-      const order = new Map(out.seller_quotes.map((q,i)=>[q,i]));
-      for (const k of BUCKET_ORDER) {
-        const validQuotesInBucket = [...allBucketedEvidence[k]].map(q => String(q).trim()).filter(q => finalSellerQuotesSet.has(q));
-        out.evidence_buckets[k] = validQuotesInBucket.sort((a, b) => order.get(a) - order.get(b)).slice(0, maxSeller);
-      }
-      return out;
-    }
-
-    async function adaptiveIndexSingle(apiKey, part, sellerId, internalSpeakers, depth = 0) {
-      try {
-        return await callGeminiIndex(apiKey, part, sellerId, internalSpeakers);
-      } catch (e) {
-        const msg = String(e?.message || e);
-        const transient = /timeout|timed out|429|5\d\d|unavailable|quota|exhausted/i.test(msg);
-        if (!transient || depth >= INDEX_SPLIT_MAX_DEPTH) throw e;
-        if (depth < INDEX_SPLIT_MAX_DEPTH) {
-          const mid = Math.floor(part.length / 2);
-          const a = part.slice(0, mid).trim();
-          const b = part.slice(mid).trim();
-          if (a && b) {
-            const [idxA, idxB] = await Promise.all([
-              adaptiveIndexSingle(apiKey, a, sellerId, internalSpeakers, depth + 1),
-              adaptiveIndexSingle(apiKey, b, sellerId, internalSpeakers, depth + 1),
-            ]);
-            return mergeIndexes([idxA, idxB], MAX_SELLER_QUOTES, MAX_CUSTOMER_CUES, sellerId);
-          }
-        }
-        throw e;
-      }
-    }
-
-    
-// === Heuristic conversation-map index (fast path) ======================
-function parseTurnsRaw(transcript) {
-  const t = String(transcript || "");
-  const rx = /^([A-Za-z0-9_\- ]+):\s*([\s\S]*?)(?=\n[A-Za-z0-9_\- ]+:|$)/gm;
-  const turns = [];
-  let m; let i = 0;
-  while ((m = rx.exec(t)) !== null) {
-    const speaker = m[1].trim();
-    const text = (m[2] || "").trim();
-    if (!speaker || !text) continue;
-    turns.push({ i: i++, speaker, text });
-  }
-  if (!turns.length) {
-    // single-speaker transcript; treat entire thing as one seller turn
-    return [{ i: 0, speaker: "Seller", text: t.trim() }];
-  }
-  return turns;
-}
-
-function detectActsHeuristic(text) {
-  const s = String(text || "").toLowerCase();
-  const acts = new Set();
-  // questions / probing
-  if (/[?]/.test(s) || /(can you|could you|would you|what|how|why|when|where)\b/.test(s)) acts.add("ask_probe");
-  // clarifying / validating
-  if (/\bso what i'm hearing|just to confirm|to make sure i understand|if i heard you right\b/.test(s)) acts.add("clarify_validate");
-  // summarizing
-  if (/\bto summarize|let me recap|sounds like you\b/.test(s)) acts.add("summarize_synthesize");
-  // empathy / labeling
-  if (/\bthat sounds|i can see|it seems|i get that\b/.test(s)) acts.add("empathize_label");
-  // quantify
-  if (/\b\d{1,3}(,\d{3})*\b/.test(s) || /(kpi|roi|percent|%|cost|revenue|budget|timeline|deadline)/.test(s)) acts.add("quantify_measure");
-  // connect / link
-  if (/\bconnect|relate|tie this to|based on that\b/.test(s)) acts.add("connect_link");
-  // document / commit
-  if (/\bnext step|i'll send|let me follow up|i will follow up|we'll schedule\b/.test(s)) acts.add("document_commit");
-  // explain / teach
-  if (/\bfor example|example:|e\.g\.|let's say|imagine\b/.test(s)) acts.add("explain_teach");
-  // position value
-  if (/\bvalue|benefit|the reason|this helps\b/.test(s)) acts.add("position_value");
-  return Array.from(acts);
-}
-
-function buildHeuristicIndex(transcriptFull, opts = {}) {
-  const {
-    sellerId = null,
-    maxSeller = MAX_SELLER_QUOTES,
-    maxCues   = MAX_CUSTOMER_CUES,
-    internalSpeakers = []        // <-- new (array or Set of names/labels)
-  } = opts;
-
-  const internalSet = (internalSpeakers instanceof Set)
-    ? new Set(Array.from(internalSpeakers).map(s => String(s).toLowerCase().trim()))
-    : new Set((internalSpeakers || []).map(s => String(s).toLowerCase().trim()));
-
-  const turns = parseTurnsRaw(normalizeTranscript(transcriptFull));
-
-  // Try to resolve a concrete speaker label from sellerId (case-insensitive, lenient)
-  function resolveSellerSpeaker(sellerId, turns) {
-    if (!sellerId) return null;
-    const want = String(sellerId).toLowerCase().trim();
-
-    // exact (case-insensitive)
-    const exact = turns.find(t => t.speaker.toLowerCase().trim() === want);
-    if (exact) return exact.speaker;
-
-    // “contains” either way (handles “Megan” vs “Megan Sexton”)
-    const contains = turns.find(t => {
-      const s = t.speaker.toLowerCase().trim();
-      return s.includes(want) || want.includes(s);
-    });
-    if (contains) return contains.speaker;
-
-    // Best-effort token overlap (all tokens of shorter name exist in longer)
-    const wantTokens = want.split(/\s+/).filter(Boolean);
-    const scored = turns
-      .map(t => {
-        const sTokens = t.speaker.toLowerCase().trim().split(/\s+/).filter(Boolean);
-        const shorter = wantTokens.length <= sTokens.length ? wantTokens : sTokens;
-        const longer  = shorter === wantTokens ? sTokens : wantTokens;
-        const allIn = shorter.every(tok => longer.includes(tok));
-        return { speaker: t.speaker, match: allIn ? shorter.length : 0 };
-      })
-      .sort((a,b) => b.match - a.match);
-    return scored[0]?.match ? scored[0].speaker : null;
-  }
-
-  // Behavior-based seller, but skip internal speakers
-  function inferSellerByBehaviorExcluding(turns, internalSet) {
-    const stats = new Map();
-    for (const t of turns) {
-      const who = String(t.speaker || "").toLowerCase().trim();
-      if (internalSet.has(who)) continue; // exclude internal from candidacy
-      if (!stats.has(t.speaker)) stats.set(t.speaker, { q:0, explain:0, value:0, words:0, turns:0 });
-      const st = stats.get(t.speaker);
-      const acts = detectActsHeuristic(t.text);
-      st.q += acts.includes("ask_probe") ? 1 : 0;
-      st.explain += acts.includes("explain_teach") ? 1 : 0;
-      st.value += acts.includes("position_value") ? 1 : 0;
-      st.words += t.text.split(/\s+/).length;
-      st.turns += 1;
-    }
-    // choose best non-internal; if none, fallback to the first non-internal turn
-    let best = null, bestScore = -1;
-    for (const [speaker, st] of stats) {
-      const score = 2*st.q + 1.5*st.explain + 1.2*st.value + 0.0005*st.words + 0.05*st.turns;
-      if (score > bestScore) { bestScore = score; best = speaker; }
-    }
-    if (best) return best;
-    const firstNonInternal = turns.find(t => !internalSet.has(String(t.speaker).toLowerCase().trim()));
-    return firstNonInternal?.speaker || turns[0]?.speaker || "Seller";
-  }
-
-  const forcedSeller = sellerId ? resolveSellerSpeaker(sellerId, turns) : null;
-  // If the forced seller resolves to an internal label, still honor it (you explicitly chose it).
-  // Otherwise fall back to behavior-based, excluding internal colleagues.
-  const sellerLabel = forcedSeller || inferSellerByBehaviorExcluding(turns, internalSet);
-
-  const evidence_buckets = {};
-  for (const k of BUCKET_ORDER) evidence_buckets[k] = [];
-
-  const seller_quotes = [];
-  const customer_cues = [];
-
-  for (const t of turns) {
-    const acts = detectActsHeuristic(t.text);
-    const speakerLc = String(t.speaker || "").toLowerCase().trim();
-
-    if (t.speaker === sellerLabel) {
-      seller_quotes.push(t.text);
-      for (const a of acts) {
-        if (evidence_buckets[a] && evidence_buckets[a].length < maxSeller) {
-          evidence_buckets[a].push(t.text);
-        }
-      }
-      if (acts.length === 0 && evidence_buckets.other.length < maxSeller) {
-        evidence_buckets.other.push(t.text);
-      }
-    } else {
-      // Only treat as "customer" if NOT internal and NOT the seller
-      if (!internalSet.has(speakerLc)) {
-        customer_cues.push(t.text);
-      }
-      // else: colleague/host/etc — ignore for customer cues
-    }
-  }
-
-  const out = {
-    seller_label: sellerLabel,
-    seller_quotes: sortQuotesDeterministic(seller_quotes).slice(0, maxSeller),
-    customer_cues: sortQuotesDeterministic(customer_cues).slice(0, maxCues),
-    evidence_buckets
-  };
-
-  // keep buckets consistent with seller_quotes set & preserve order
-  const order = new Map(out.seller_quotes.map((q,i)=>[q,i]));
-  for (const k of BUCKET_ORDER) {
-    const arr = (evidence_buckets[k] || []).filter(q => order.has(q));
-    const uniq = [...new Set(arr)];
-    evidence_buckets[k] = uniq.sort((a,b)=>order.get(a)-order.get(b)).slice(0, maxSeller);
-  }
-
-  return out;
-}
-
-async function indexTranscriptSmart(apiKey, transcriptFull, sellerId = null, internalSpeakers = []) {
-  const t = normalizeTranscript(transcriptFull);
-  const parts = splitOnSpeakerBoundaries(t, INDEX_SEGMENT_CHARS, INDEX_SEGMENT_MAX);
-  timing.index_segments = parts.length;
-  const tS = Date.now();
-
-  if (parts.length === 1) {
-    const res = await adaptiveIndexSingle(apiKey, parts[0], sellerId, internalSpeakers, 0);
-    timing.index_ms = Date.now() - tS;
-    return res;
-  }
-
-  const tasks = parts.map((p) => () => adaptiveIndexSingle(apiKey, p, sellerId, internalSpeakers, 0));
-  const results = await runWithPool(tasks, Math.min(MAX_CONCURRENCY, 3));
-  const valid = results.filter(Boolean);
-  timing.index_ms = Date.now() - tS;
-  if (!valid.length) throw new Error("Indexing failed for all segments");
-  return mergeIndexes(valid, MAX_SELLER_QUOTES, MAX_CUSTOMER_CUES, sellerId);
-}
-
-    function splitOnSpeakerBoundaries(t, target = INDEX_SEGMENT_CHARS, maxParts = INDEX_SEGMENT_MAX) {
-      if (t.length <= target) return [t];
-      const turnRegex = /^([A-Za-z0-9_ ]+):\s*([\s\S]*?)(?=\n[A-Za-z0-9_ ]+:|$)/gm;
-      const turns = [];
-      let match;
-      while ((match = turnRegex.exec(t)) !== null) {
-        turns.push({ speaker: match[1].trim(), text: match[2].trim() });
-      }
-      if (turns.length === 0) {
-        const chunks = [];
-        for (let i = 0; i < t.length; i += target) {
-          chunks.push(t.substring(i, i + target));
-        }
-        return chunks.slice(0, maxParts);
-      } 
-      function splitLongTurn(speaker, text, targetSize) {
-        const subTurns = [];
-        const sentences = text.match(/[^.!?]+[.!?]*\s*/g) || [text];
-        let currentSubTurnText = "";
-        for (const sentence of sentences) {
-          if (currentSubTurnText.length + sentence.length > targetSize) {
-            if (currentSubTurnText) subTurns.push({ speaker, text: currentSubTurnText.trim() });
-            currentSubTurnText = sentence;
-          } else {
-            currentSubTurnText += sentence;
-          }
-        }
-        if (currentSubTurnText) subTurns.push({ speaker, text: currentSubTurnText.trim() });
-        return subTurns;
-      }
-      const chunks = [];
-      let currentChunk = "";
-      for (const turn of turns) {
-        const turnString = `${turn.speaker}: ${turn.text}\n`;
-        if (turnString.length > target) {
-          if (currentChunk.length > 0) {
-            chunks.push(currentChunk.trim());
-            currentChunk = "";
-          }
-          const subTurns = splitLongTurn(turn.speaker, turn.text, target - (turn.speaker.length + 5));
-          for (const subTurn of subTurns) {
-            chunks.push(`${subTurn.speaker}: ${subTurn.text}`);
-          }
-          continue;
-        }
-        if (currentChunk.length + turnString.length > target && currentChunk.length > 0) {
-          chunks.push(currentChunk.trim());
-          currentChunk = "";
-        }
-        currentChunk += turnString;
-      }
-      if (currentChunk.length > 0) chunks.push(currentChunk.trim());
-      return chunks.slice(0, maxParts);
-    }
-
-    async function runWithPool(tasks, limit = MAX_CONCURRENCY) {
-      const results = [];
-      let i = 0;
-      const workers = new Array(Math.min(limit, tasks.length)).fill(0).map(async () => {
-
-        while (i < tasks.length) {
-          const idx = i++;
-          try { results[idx] = await tasks[idx](); }
-          catch (err) { results[idx] = { __error: true, error: String(err) }; }
-        }
-      });
-      await Promise.all(workers);
-      return results;
-    }
-
-    function trimIndex(idx, maxSeller = MAX_SELLER_QUOTES, maxCues = MAX_CUSTOMER_CUES) {
-      if (!idx || typeof idx !== "object") return idx;
-      const out = JSON.parse(JSON.stringify(idx || {}));
-      out.seller_quotes = sortQuotesDeterministic(out.seller_quotes).slice(0, maxSeller);
-      out.customer_cues = sortQuotesDeterministic(out.customer_cues).slice(0, maxCues);
-      const order = new Map(out.seller_quotes.map((q,i)=>[q,i]));
-      const eb = out.evidence_buckets || {};
-      for (const k in eb) {
-        const arr = (eb[k] || []).map(q => String(q).trim()).filter(q => order.has(q));
-        const uniq = [...new Set(arr)];
-        eb[k] = uniq.sort((a, b) => order.get(a) - order.get(b)).slice(0, maxSeller);
-      }
-      out.evidence_buckets = eb;
-      return out;
-    }
-
-    // ===== PIPELINE =====
-    const suppliedSkillCount = (() => {
-      let n = 0;
-      for (const comp in rubrics || {}) {
-        const skillsObj = rubrics[comp]?.skills;
-        if (skillsObj) n += Object.keys(skillsObj).length;
-      }
-      return n;
-    })();
-    if (suppliedSkillCount > MAX_SKILLS_CAP) {
-      return new Response(JSON.stringify({ error: `Too many skills (${suppliedSkillCount}) > cap (${MAX_SKILLS_CAP})` }), { status: 400, headers });
-    }
-    if (Array.isArray(skills) && skills.length && suppliedSkillCount > skills.length) {
-      const setRaw = new Set(skills.map((s) => String(s)));
-      const filtered = {};
-      for (const comp in rubrics || {}) {
-        const compSkills = rubrics[comp]?.skills;
-        if (!compSkills) continue;
-        for (const skill in compSkills) {
-          const keyA = skill, keyB = `${comp}|${skill}`;
-          if (setRaw.has(keyA) || setRaw.has(keyB)) {
-            if (!filtered[comp]) filtered[comp] = { skills: {} };
-            filtered[comp].skills[skill] = compSkills[skill];
-          }
-        }
-      }
-      rubrics = filtered;
-    }
-
-    transcript = normalizeTranscript(transcript);
-
-    // Determine which skills to assess (default = all in rubrics)
-    let requestedSkills = Array.isArray(skills) && skills.length
-    ? skills.map(String)
-    : (() => {
-       const all = [];
-       for (const comp in rubrics || {}) {
-         const s = rubrics[comp]?.skills || {};
-          for (const k in s) all.push(k);
-        }
-        return all;
-    })();
-
-    const presentSkills = [];
-    const missingSkills = [];
-    const resolvedSkills = []; // [{ skillName, rubricData }]
-
-    for (const s of requestedSkills) {
-      const hit = resolveSkill(rubrics, s);
-      if (hit && hit.rubricData && Array.isArray(hit.rubricData.levels) && hit.rubricData.levels.length) {
-        presentSkills.push(hit.skillName);
-        resolvedSkills.push({ skillName: hit.skillName, rubricData: hit.rubricData });
-      } else {
-        missingSkills.push(s);
-      }
-    }
-
-    // Compute ONCE; reuse later for per-skill cache keys
-    const indexKeyInput = stable({
-      v: CACHE_VERSION,
-      INDEX_MODEL,
-      MAX_SELLER_QUOTES,
-      MAX_CUSTOMER_CUES,
-      MAX_QUOTE_WORDS,
-      INDEX_SEGMENT_CHARS,
-      INDEX_SEGMENT_MAX,
-      INDEX_SPLIT_MAX_DEPTH,
-      transcript,
-      sellerId,
-      skill: presentSkills && presentSkills.length === 1 ? presentSkills[0] : presentSkills
-    });
-    const indexKeyHash = await sha256Hex(indexKeyInput);
-    const indexKVKey  = `v${CACHE_VERSION}:index:${indexKeyHash}`;
-
-    let rawIndex = null;
-    let index_kv_hit = false;
-
-    if (env.ASSESS_CACHE) {
-      rawIndex = await kvGetJSON(env.ASSESS_CACHE, indexKVKey);
-      if (rawIndex) index_kv_hit = true;
-    }
-
-    if (!rawIndex) {
-      rawIndex = (String(env.USE_CONV_MAP || '').trim() === '1')
-        ? buildHeuristicIndex(transcript, {
-            maxSeller: MAX_SELLER_QUOTES,
-            maxCues:   MAX_CUSTOMER_CUES,
-            sellerId,
-            internalSpeakers: internalArr    // ← correct key + array
-          })
-        : await indexTranscriptSmart(
-            GEMINI_API_KEY,
-            transcript,
-            sellerId,
-            internalArr                      // ← array, not Set
-          );
-    
-      if (env.ASSESS_CACHE) await kvPutJSON(env.ASSESS_CACHE, indexKVKey, rawIndex, KV_TTL_SECS, CACHE_VERSION);
-      await edgePutJSON(edgeKey("index", indexKeyHash), rawIndex);
-    }
-
-    console.log("[INDEX] mode:", String(env.USE_CONV_MAP||'')==='1' ? "heuristic" : "gemini", {
-      sellerId,
-      resolved_seller_label: rawIndex?.seller_label,
-      seller_quotes_count: rawIndex?.seller_quotes?.length || 0,
-      customer_cues_count: rawIndex?.customer_cues?.length || 0
-    });
-
-    const index = trimIndex(rawIndex, MAX_SELLER_QUOTES, MAX_CUSTOMER_CUES);
-
-    if (sellerId) {
-      // Guarantee downstream uses the user-selected seller name
-      index.seller_label = sellerId;
-      console.log("[WORKER] forcing seller to provided sellerId", { sellerId, indexSellerLabel: index?.seller_label });
-    }
-
-    // === assessment engine (OpenRouter judge + coach) ======================
-    function buildGatingSummary(levels) {
-      const normalized = normalizeChecks(JSON.parse(JSON.stringify(levels || [])));
-      const sorted = [...normalized].sort((a,b)=> (a.level||0)-(b.level||0));
-      const highest = computeHighestDemonstrated(sorted);
-      const out = [];
-      for (const lvl of sorted) {
-        const rq = levelRequiredQuotes(lvl.level || 0);
-        const positives = (lvl.checks || []).filter(c => (c.polarity || "positive") === "positive" && (c?.observable ?? true) === true);
-        const metDirect = positives.filter(c => c.met && (c.evidence||[]).length >= rq).map(c => c.characteristic);
-        let attainedViaHigher = [];
-        let unmet = [];
-        if ((lvl.level || 0) < highest) {
-          attainedViaHigher = positives.filter(c => !(c.met && (c.evidence||[]).length >= rq)).map(c => c.characteristic);
-        } else {
-          unmet = positives.filter(c => !(c.met && (c.evidence||[]).length >= rq)).map(c => c.characteristic);
-        }
-        out.push({ level: lvl.level, name: lvl.name, positives_met: metDirect, positives_unmet: unmet, positives_attained_via_higher: attainedViaHigher });
-      }
-      return out;
-    }
-
-    async function getAssessmentForSkill(apiKey_UNUSED, transcript, skillName, rubricData, index, wl, DEBUG_PROMPT_FLAG) {
-      const MAX_QUOTE_WORDS = num(env.MAX_QUOTE_WORDS, 50);
-      const ENFORCE_MAX = bool(env.ENFORCE_MAX_WORDS_IN_EVIDENCE, true);
-      const normalizeQ = makeNormalizeQuote(MAX_QUOTE_WORDS, ENFORCE_MAX);
-
-      let allowedQuotes = Array.isArray(wl) && wl.length
-        ? wl.map(normalizeQ).filter(Boolean)
-        : (index?.seller_quotes || []).map(normalizeQ).filter(Boolean);
-
-      const tA0 = Date.now();
-      let promptBytes = 0;
-
-      function attachDebug(assessment, ctx = {}) {
-        if (!DEBUG_PROMPT_FLAG) return assessment;
-      
-        const { judgeResp, coachResp } = ctx; // may be undefined on early returns
-        try {
-          const rawJudge = judgeResp
-            ? (typeof judgeResp.content === "string" && judgeResp.content) || judgeResp.raw || ""
-            : "";
-          const rawCoach = coachResp
-            ? (typeof coachResp.content === "string" && coachResp.content) || coachResp.raw || ""
-            : "";
-      
-          const SLICE = 8000;
-          assessment._debug = assessment._debug || {};
-          if (rawJudge) assessment._debug.rawJudgeOutput = String(rawJudge).slice(0, SLICE);
-          if (rawCoach) assessment._debug.rawCoachOutput = String(rawCoach).slice(0, SLICE);
-        } catch (e) {
-          assessment._debug = assessment._debug || {};
-          assessment._debug.debugAttachError = String(e?.message || e);
-        }
-        return assessment;
-      }
-
-      if (!rubricData || !Array.isArray(rubricData.levels) || rubricData.levels.length === 0) {
-        return attachDebug({
-          skill: skillName, rating: 1, strengths: [], improvements: [], coaching_tips: [],
-          seller_identity: index?.seller_label || "Seller",
-          level_checks: [], gating_summary: [],
-          _debug: { missing_rubric: true },
-          _raw_model_output: [],
-          _served_by: { judge: env.JUDGE_MODEL || "meta-llama/llama-3.1-70b-instruct", coach: env.WRITER_MODEL || "openai/gpt-4o-mini" }
-        });
-      }
-
-      const lvlCount = Array.isArray(rubricData?.levels) ? rubricData.levels.length : 0;
-      let totalChecks = 0;
-      for (const lvl of (rubricData?.levels || [])) {
-        totalChecks += Array.isArray(lvl?.checks) ? lvl.checks.length : 0;
-      }
-      if (lvlCount === 0 || totalChecks === 0) {
-        return attachDebug({
-          skill: skillName,
-          rating: 1,
-          strengths: [],
-          improvements: [],
-          coaching_tips: [],
-          seller_identity: index?.seller_label || "Seller",
-          level_checks: [],
-          gating_summary: [],
-          _debug: { malformed_rubric: true, lvlCount, totalChecks },
-          _raw_model_output: [],
-          _served_by: { judge: env.JUDGE_MODEL || "meta-llama/llama-3.1-70b-instruct", coach: env.WRITER_MODEL || "openai/gpt-4o-mini" }
-        });
-      }
-
-
-      // ---- Build judge prompt (exceptions allowed for customer cues if needed)
-      const customerEvidenceChecks = new Set();
-      for (const level of rubricData?.levels || []) {
-        for (const check of level?.checks || []) {
-          if (isCustomerEvidenceRequired(check.characteristic)) {
-            customerEvidenceChecks.add(String(check.characteristic || '').trim());
-          }
-        }
-      }
-
-      if (DEBUG_PROMPT_FLAG) {
-        dlog(`[judge:${skillName}] whitelist size=${allowedQuotes.length} first3=`, allowedQuotes.slice(0,3));
-        dlog(`[judge:${skillName}] customer_cues size=${(index?.customer_cues || []).length}`);
-        dlog(`[judge:${skillName}] quotes_to_model=${allowedQuotes.length}`);
-        if (String(env.BYPASS_WHITELIST || '').trim() === '1') {
-          dlog(`[judge:${skillName}] BYPASS_WHITELIST active: feeding full index.seller_quotes`);
-        }
-      }
-      
-      const judgeUser = buildAnalysisPrompt(
-        skillName,
-        rubricData,
-        index,
-        allowedQuotes
-      );
-
-      // --- DEBUG: prompt preview & rubric metrics ---
-      if (DEBUG_PROMPT_FLAG) {
-          const head = judgeUser.slice(0, 800);
-          const tail = judgeUser.slice(-800);
-          let checkCount = 0;
-          for (const lvl of (rubricData?.levels || [])) {
-            checkCount += Array.isArray(lvl?.checks) ? lvl.checks.length : 0;
-          }
-          console.log(`[judge:${skillName}] HEAD:\n${head}\n---\nTAIL:\n${tail}\n---`);
-          console.log(`rubric_levels=${Array.isArray(rubricData?.levels)?rubricData.levels.length:0} rubric_checks=${checkCount} rubric_bytes=${bytes(JSON.stringify(rubricData))} quotes_allowed=${allowedQuotes.length} customer_cues=${(index?.customer_cues||[]).length}`);
-        }
-      // ----------------------------------------------
-
-      // ---- 1) JUDGE ----------------------
-      const judgeResp = await withRetry(() => chatOpenRouter(env, {
-  model: env.JUDGE_MODEL || "meta-llama/llama-3.1-70b-instruct",
-        temperature: 0.1,
-        max_tokens: 20000,
-        tools: [{
-          type: "function",
-          function: {
-            name: "extract_rubric_analysis",
-            description: "Extract the rubric analysis based on the transcript.",
-            parameters: {
-              type: "object",
-              properties: {
-                level_checks: {
-                  type: "array",
-                  items: {
-                    type: "object",
-                    properties: {
-                      level: { type: "integer" },
-                      name: { type: "string" },
-                      checks: {
-                        type: "array",
-                        items: {
-                          type: "object",
-                          properties: {
-                            characteristic: { type: "string" },
-                            polarity: { enum: ["positive", "negative", "limitation"] },
-                            met: { type: "boolean" },
-                            evidence: { type: "array", items: { type: "string" } },
-                            reason: { type: "string" }
-                          },
-                          required: ["characteristic","polarity","met","evidence","reason"]
-                        }
-                      }
-                    },
-                    required: ["level","name","checks"]
-                  }
-                }
-              },
-              required: ["level_checks"]
-            }
-          }
-        }],
-        tool_choice: { type: "function", function: { name: "extract_rubric_analysis" }}, // <-- FORCE THE MODEL TO USE THE TOOL
-        messages: [
-          { role: "system", content: OR_SYSTEM_JUDGE },
-          { role: "user", content: judgeUser }
-        ],
-        provider: providerPrefs(env)
-      }, { hint: "judge" }), { retries: 1, baseMs: 350, factor: 1.6 });
-
-      
-      promptBytes += bytes(judgeUser);
-
-      if (DEBUG_PROMPT_FLAG) {
-        const blob = (judgeResp.content || judgeResp.raw || "");
-        dlog(`[judge:${skillName}] served_by=${judgeResp.servedBy}`);
-        dlog(`[judge:${skillName}] model content head:\n${blob.slice(0, 800)}\n---`);
-        console.log(`[judge:${skillName}] model content head:\n${String(blob).slice(0,600)}\n---`);
-        const raw = String(judgeResp.content || judgeResp.raw || "");
-        const served = judgeResp.servedBy || "unknown";
-        const chunkSize = 1000; // avoid truncation in dashboard
-        console.log(`[judge:${skillName}] full JSON from model (served_by=${served}, length=${raw.length}):`);
-        for (let i = 0; i < raw.length; i += chunkSize) {
-          console.log(raw.slice(i, i + chunkSize));
-        }
-        console.log("--- END FULL JUDGE JSON ---");
-      }
-      
-console.log(`[judge:${skillName}] typeof content=${typeof judgeResp?.content}`);
-console.log(`[judge:${skillName}] raw content preview=`, JSON.stringify(judgeResp?.content)?.slice(0, 400));
-console.log(`[judge:${skillName}] judgeResp.content length=${(judgeResp?.content || '').length}`);
-
-
-// --- parse & normalize judge output ---
-let parsedJudge = null;
-
-try {
-  if (typeof judgeResp?.content === "object" && judgeResp.content?.level_checks) {
-    // Case 1: OpenRouter or model already returned a structured JSON object
-    parsedJudge = judgeResp.content;
-
-  } else if (judgeResp?.json?.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments) {
-    // Case 2: Handle Tool Use response
-    const toolArgs = judgeResp.json.choices[0].message.tool_calls[0].function.arguments;
-    parsedJudge = JSON.parse(toolArgs);
-
-  } else if (typeof judgeResp?.content === "string" && judgeResp.content.trim()) {
-    // Case 3: Plain JSON string
-    parsedJudge = JSON.parse(judgeResp.content);
-
-  } else if (judgeResp?.json?.choices?.[0]?.message?.content) {
-    // Case 4: Nested inside OpenAI-style response
-    parsedJudge = JSON.parse(judgeResp.json.choices[0].message.content);
-
-  } else if (judgeResp?.raw) {
-    // Case 5: Fallback to raw text — extract first {...} block
-    const match = String(judgeResp.raw).match(/\{[\s\S]*\}/);
-    if (match) parsedJudge = JSON.parse(match[0]);
-  }
-} catch (e) {
-  console.log(`[judge:${skillName}] parse fail`, e);
-}
-
-// --- Fallback and key normalization ---
-if (!parsedJudge || typeof parsedJudge !== "object") parsedJudge = { level_checks: [] };
-
-const lc = Array.isArray(parsedJudge.level_checks)
-  ? parsedJudge.level_checks
-  : Array.isArray(parsedJudge.levelChecks)
-    ? parsedJudge.levelChecks
-    : [];
-
-parsedJudge = { level_checks: lc };
-// --- end robust parse block ---
-
-
-      // ---- Post-process -----------------------------------------------------
-      const rawLevelChecks = JSON.parse(JSON.stringify(parsedJudge.level_checks));
-      const checksWithObservableFlags = applyObservableFlags(parsedJudge.level_checks, rubricData);
-      const rawNormalized = normalizePolarity(checksWithObservableFlags);
-
-      const sellerQuotesSet = new Set((index?.seller_quotes || []).map(normalizeQ));
-      let levelChecks = sanitizeEvidenceAgainstIndex(
-        JSON.parse(JSON.stringify(rawNormalized)),
-        sellerQuotesSet,
-        transcript,
-        new Set(allowedQuotes)
-      );
-      
-    if (index_v2) { levelChecks = enforceEvidenceQualityForPositivesDynamic(levelChecks, index_v2, rubricData); }
-levelChecks = enforceNegativeGuard(levelChecks);
-
-      // --- Limitation post-processing: set met=true if evidence matches limitation exactly ---
-      function limitationPostProcess(levelChecks) {
-        for (const lvl of levelChecks || []) {
-          for (const check of (lvl.checks || [])) {
-            if (check.polarity === 'limitation' && check.met === false && Array.isArray(check.evidence) && check.evidence.length > 0) {
-              // If the evidence is not worse than the limitation, set met=true
-              // Heuristic: if the evidence is present and matches the limitation description, set met=true
-              // (This is a best-effort, as 'worse than' is subjective)
-              const charNorm = String(check.characteristic || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-              const evNorm = check.evidence.map(e => String(e).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim());
-              // If any evidence is a substring or equal to the characteristic, treat as 'same as'
-              if (evNorm.some(e => charNorm && (e === charNorm || charNorm.includes(e) || e.includes(charNorm)))) {
-                check.met = true;
-                check.reason = `[AUTO-CORRECTED] Evidence matches limitation exactly; set met: true. Original reason: ${check.reason}`;
-              }
-            }
-          }
-        }
-        return levelChecks;
-      }
-      levelChecks = limitationPostProcess(levelChecks);
-
-      const ratingRaw = computeHighestDemonstrated(rawNormalized);
-      const ratingSanitized = computeHighestDemonstrated(levelChecks);
-
-      // Optional soft-floor logic retained
-      const countMet = (checks) => checks.flatMap(l => l.checks || []).filter(c => c?.polarity !== "limitation" && c?.met === true).length;
-      const metRaw = countMet(rawNormalized);
-      const metAfter = countMet(levelChecks);
-      const evidenceLossRatio = metRaw > 0 ? (metRaw - metAfter) / metRaw : 0;
-
-      const LOSS_THRESHOLD = 0.6;
-      const RAW_MIN_FOR_FLOOR = 3;
-      const MAX_SOFT_FLOOR = 3;
-      // Cap rating at rubric's max valid level (exclude 'Not applicable')
-      let rating = ratingSanitized;
-      // Find max valid rubric level (exclude 'Not applicable' and empty checks)
-      const validLevels = (rubricData?.levels || []).filter(l => l.name && l.name.toLowerCase() !== 'not applicable' && l.checks && l.checks.length > 0);
-      const maxRubricLevel = validLevels.length ? Math.max(...validLevels.map(l => l.level || 0)) : 5;
-      if (rating > maxRubricLevel) rating = maxRubricLevel;
-      if (ratingSanitized <= 1 && ratingRaw >= RAW_MIN_FOR_FLOOR && evidenceLossRatio >= LOSS_THRESHOLD) {
-        rating = Math.min(MAX_SOFT_FLOOR, Math.max(2, ratingRaw - 1));
-      }
-
-      const gating_summary = buildGatingSummary(levelChecks);
-
-      // ---- 2) COACH (CORRECTED LOGIC) ------------------------
-
-      // STEP 1: PRE-BUILD the improvements array based on unmet positives.
-      let improvements_template = [];
-      const nextLevel = gating_summary.find(lvl => lvl.level === rating + 1);
-      if (nextLevel && nextLevel.positives_unmet) {
-        for (const unmet_point of nextLevel.positives_unmet) {
-            improvements_template.push({
-                point: unmet_point,
-                example: {
-                    instead_of: "", // We will fill this in next
-                    try_this: ""
-                }
-            });
-        }
-      }
-
-      // STEP 2: BACKFILL the template with the best available evidence.
-      // This now happens BEFORE calling the coach.
-      const populated_improvements = backfillImprovementQuotes(improvements_template, levelChecks);
-      for (const imp of populated_improvements) {
-        if (imp && imp.quote) {
-          imp.example = imp.example || { instead_of: "", try_this: "" };
-          imp.example.instead_of = imp.quote;
-        }
-      }
-      // STEP 3: BUILD the prompt with the now-populated data.
-      const coachUser = buildCoachingPrompt(skillName, rating, levelChecks, gating_summary, populated_improvements);
-      promptBytes += bytes(coachUser);
-   
-      // STEP 4: CALL the coach with the prepared data.
-      const coachResp = await withRetry(() => chatOpenRouter(env, {
-        model: env.WRITER_MODEL || "openai/gpt-4o-mini",
-        temperature: 0.2,
-        max_tokens: 4096,
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            name: "coaching_feedback_schema",
-            schema: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                strengths: { type: "array", items: { type: "string" } },
-                improvements: {
-                  type: "array",
-                  items: {
-                    type: "object",
-                    additionalProperties: false,
-                    properties: {
-                      point: { type: "string" },
-                      example: {
-                        type: "object",
-                        additionalProperties: false,
-                        properties: {
-                          instead_of: { type: "string" },
-                          try_this: { type: "string" }
-                        },
-                        required: ["instead_of", "try_this"]
-                      }
-                    },
-                    required: ["point", "example"]
-                  }
-                },
-                coaching_tips: { type: "array", items: { type: "string" } }
-              },
-              required: ["strengths", "improvements", "coaching_tips"]
-            }
-          }
-        },
-        messages: [
-          { role: "system", content: OR_SYSTEM_COACH },
-          { role: "user", content: coachUser }
-        ],
-      }, { hint: "coach" }), { retries: 1 });
-
-      // STEP 5: Parse the final response.
-      let strengths = [], improvements = [], coaching_tips = [];
-      try {
-          let coachObj = null;
-          if (typeof coachResp.content === 'string' && coachResp.content.trim()) {
-              coachObj = JSON.parse(coachResp.content);
-          } else if (coachResp.json?.choices?.[0]?.message?.content) {
-              coachObj = JSON.parse(coachResp.json.choices[0].message.content);
-          }
-          if (coachObj) {
-              strengths = coachObj.strengths || [];
-              improvements = coachObj.improvements || []; 
-              coaching_tips = coachObj.coaching_tips || [];
-          }
-      } catch (e) {
-          console.log(`[coach:${skillName}] parse fail`, e);
-      }
-
-      const allUnmetPositives = new Set(
-        (gating_summary || []).flatMap(l => l.positives_unmet || [])
-      );
-      
-      // Keep only improvements whose `point` is truly an unmet positive
-      improvements = (improvements || []).filter(
-        imp => imp && allUnmetPositives.has(String(imp.point || "").trim())
-      );
-      
-      // If there are no unmet positives, force empty improvements
-      if (allUnmetPositives.size === 0) {
-        improvements = [];
-        // Optionally pivot coaching_tips to “sustain what’s working”
-        if (!coaching_tips || coaching_tips.length === 0) {
-          coaching_tips = [
-            "Keep opening with targeted discovery to reaffirm priorities.",
-            "Continue paraphrasing and confirming needs to maintain alignment.",
-            "Tie every recommendation back to the explicit goals you captured."
-          ];
-        }
-      }
-
-// populate the 'instead_of' quotes 👇
-improvements = backfillImprovementQuotes(improvements, levelChecks);
-
-      const ms = Date.now() - tA0;
-      timing.assess_calls.push({ mode: "single_decoupled_or", skills: 1, ms, prompt_bytes: promptBytes, skill: skillName });
-      timing.assess_ms_total += ms;
-      timing.prompt_bytes_total += promptBytes;
-
-      return attachDebug({
-        skill: skillName, rating,
-        strengths, improvements, coaching_tips,
-        seller_identity: index?.seller_label || "Seller",
-        level_checks: levelChecks, gating_summary,
-        _debug: { ratingRaw, ratingSanitized, metRaw, metAfter, evidenceLossRatio },
-        _raw_model_output: rawLevelChecks,
-  _served_by: { judge: env.JUDGE_MODEL || "meta-llama/llama-3.1-70b-instruct", coach: env.WRITER_MODEL || "openai/gpt-4o-mini" }
-      }, { judgeResp, coachResp });
-    }
-
-    async function getAssessmentsBatched(apiKey, transcript, rubricsSubset, index) {
-      const taskFns = [];
-      for (const competency in rubricsSubset) {
-        const comp = rubricsSubset[competency];
-        if (!comp || !comp.skills) continue;
-        for (const skillName in comp.skills) {
-          const rubricData = comp.skills[skillName];
-          const wl = (String(env.BYPASS_WHITELIST || '').trim() === '1')
-          ? (index?.seller_quotes || [])
-          : selectWhitelistForSkill(
-              index,
-              skillName,
-              WHITELIST_MAX,
-              transcript,
-              { maxQuoteWords: MAX_QUOTE_WORDS, enforce: ENFORCE_MAX_WORDS_IN_EVIDENCE }
-            );
-          taskFns.push(() => getAssessmentForSkill(apiKey, transcript, skillName, rubricData, index, wl, DEBUG_PROMPT_FLAG));
-        }
-      }
-      const pooledResults = await runWithPool(taskFns, Math.min(MAX_CONCURRENCY, 3));
-      return pooledResults.filter((r) => r && !r.__error);
-    }
-
-    // ===== ASSESSMENT EXECUTION =====
-    let assessments = [];
-    let assess_kv_hit = false;
-
-    if ((env.ASSESS_MODE || "parallel").toLowerCase() === "batched") {
-      // Build a tiny rubric subset from the skills we actually resolved
-      const rubricsFiltered = { filtered: { skills: {} } };
-      for (const { skillName, rubricData } of resolvedSkills) {
-        rubricsFiltered.filtered.skills[skillName] = rubricData;
-      }
-    
-      // Make a compact signature so cache invalidates if any rubric snippet changes
-      const rubricSignature = await sha256Hex(stable(
-        resolvedSkills.map(({ skillName, rubricData }) => ({ skillName, rubricData }))
-      ));
-    
-      // Prefer stable keys: include indexKeyHash (ties to transcript) + skills list + rubricSignature
-      const assessKeyInput = stable({
-        v: CACHE_VERSION,
-        ASSESS_MODEL: "openrouter",
-        limits: {
-          MIN_QUOTES_PER_POSITIVE_PASS,
-          REQUIRE_DISTINCT_EVIDENCE,
-          MAX_EVIDENCE_REUSE,
-          ENFORCE_MAX_WORDS_IN_EVIDENCE,
-          WHITELIST_MAX,
-          BUCKETS_IN_PROMPT,
-          BUCKET_SAMPLE_N,
-        },
-        indexKeyHash,               // already computed earlier for the index cache
-        skills: presentSkills,      // only the skills we’ll assess
-        rubricSignature             // hashes the rubrics so cache busts on rubric edits
-      });
-    
-      const assessKeyHash = await sha256Hex(assessKeyInput);
-      const assessKVKey = `v${CACHE_VERSION}:assess:${assessKeyHash}`;
-    
-      if (env.ASSESS_CACHE) {
-        const cached = await kvGetJSON(env.ASSESS_CACHE, assessKVKey);
-        if (cached && Array.isArray(cached.assessments)) {
-          assessments = cached.assessments;
-          assess_kv_hit = true;
-        }
-      }
-    
-      if (!assessments.length) {
-        assessments = await getAssessmentsBatched(
-          GEMINI_API_KEY,
-          transcript,
-          rubricsFiltered,   // <— only resolved skills
-          index
-        );
-    
-        if (assessments.length && env.ASSESS_CACHE) {
-          await kvPutJSON(env.ASSESS_CACHE, assessKVKey, { assessments }, KV_TTL_SECS, CACHE_VERSION);
-          await edgePutJSON(edgeKey("assess", assessKeyHash), { assessments });
-        }
-      }    
-    } else {
-      assessments = [];
-    
-      for (const { skillName, rubricData } of resolvedSkills) {
-        const wl = (String(env.BYPASS_WHITELIST || '').trim() === '1')
-          ? (index?.seller_quotes || [])
-          : selectWhitelistForSkill(
-              index,
-              skillName,
-              WHITELIST_MAX,
-              transcript,
-              { maxQuoteWords: MAX_QUOTE_WORDS, enforce: ENFORCE_MAX_WORDS_IN_EVIDENCE }
-            );
-    
-        const skillKeyHash = await simpleSkillKeyHash({ cacheVersion: CACHE_VERSION, transcript, sellerId, skillName });
-    
-        const kvKey = `v${CACHE_VERSION}:assess_skill:${skillKeyHash}`;
-    
-        let cached = null;
-        if (env.ASSESS_CACHE) cached = await kvGetJSON(env.ASSESS_CACHE, kvKey);
-    
-        if (cached && cached.assessment && !cached.assessment.__error) {
-          assessments.push(cached.assessment);
-          assess_kv_hit = true;
-        } else {
-          const assessment = await getAssessmentForSkill(
-            GEMINI_API_KEY,
-            transcript,
-            skillName,
-            rubricData,
-            index,
-            wl,
-            DEBUG_PROMPT_FLAG
-          );
-          assessments.push(assessment);
-          if (env.ASSESS_CACHE) {
-            await kvPutJSON(env.ASSESS_CACHE, kvKey, { assessment }, KV_TTL_SECS, CACHE_VERSION);
-            await edgePutJSON(edgeKey("assess_skill", skillKeyHash), { assessment });
-          }
-        }
-      }
-    }
-    
-    // ===== Assemble Response =================================================
-    const duration_ms = Date.now() - t0;
-
-    const meta = {
-      run_id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      duration_ms,
-      assess_mode: ASSESS_MODE,
-      assess_model: "openrouter",
-      index_model: INDEX_MODEL,
-      writer_model: env.WRITER_MODEL || "openai/gpt-4o-mini",
-  judge_model: env.JUDGE_MODEL || "meta-llama/llama-3.1-70b-instruct",
-      provider_order: (env.PROVIDER_ORDER || "fireworks,together,groq,google,openai"),
-      allow_fallbacks: providerPrefs(env).allow_fallbacks,
-      kv_enabled: !!env.ASSESS_CACHE,
-      kv_index_hit: !!index_kv_hit,
-      kv_assess_hit: !!assess_kv_hit,
-      edge_warmed: !!WARM_EDGE_CACHE,
-      timing,
-      rubric_source,
-      assessed_skills: presentSkills,
-      missing_skills: missingSkills,
-      limits: {
-        MAX_SELLER_QUOTES,
-        MAX_CUSTOMER_CUES,
-        MAX_QUOTE_WORDS,
-        MIN_QUOTES_PER_POSITIVE_PASS,
-        REQUIRE_DISTINCT_EVIDENCE,
-        MAX_EVIDENCE_REUSE,
-        WHITELIST_MAX,
-        BUCKETS_IN_PROMPT,
-        BUCKET_SAMPLE_N
-      }
-    };
-    
-    return new Response(JSON.stringify({
+  const responsePayload = {
       assessments,
-      meta,
-      seller_identity: index?.seller_label || "Seller"
-    }), { headers });
+      meta: { duration_ms: Date.now() - t0, run_id: crypto.randomUUID(), kv_hit: false }
+  };
 
-  } catch (error) {
-    console.error("handleFullAssessment error:", error);
-    return new Response(JSON.stringify({ error: String(error?.message || error) }), { status: 500, headers });
+  if (env.ASSESS_CACHE) {
+      await kvPutJSON(env.ASSESS_CACHE, kvKey, responsePayload, KV_TTL_SECS, CACHE_VERSION);
   }
+
+  return new Response(JSON.stringify(responsePayload), { headers });
 }
 
 
+// --- Main Export & Router ---
 export default {
   async fetch(request, env, ctx) {
-    const allowOrigin = (env.ALLOW_ORIGIN && String(env.ALLOW_ORIGIN)) || "*";
-
+    const allowOrigin = env.ALLOW_ORIGIN || "*";
     if (request.method === "OPTIONS") {
       return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": allowOrigin,
-          "Vary": "Origin",
-          "Access-Control-Allow-Methods": "POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
-          "Access-Control-Max-Age": "86400"
-        },
+        headers: { "Access-Control-Allow-Origin": allowOrigin, "Vary": "Origin", "Access-Control-Allow-Methods": "POST, GET, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization", "Access-Control-Max-Age": "86400" },
       });
     }
 
     const url = new URL(request.url);
-
-    if (request.method === "GET" && (url.pathname === "/healthz" || url.pathname === "/")) {
-      return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": allowOrigin, "Vary": "Origin" } });
+    let response;
+    try {
+        if (request.method === "POST" && url.pathname === "/qualify-skills") {
+            response = await handleQualifySkills(request, env);
+        } else if (request.method === "POST" && url.pathname === "/assess") {
+            response = await handleFullAssessment(request, env);
+        } else if (request.method === "POST" && url.pathname === "/coach") {
+            response = await handleCoachingFeedback(request, env);
+        } else if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/healthz")) {
+            response = new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+        } else {
+            response = new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+        }
+    } catch (error) {
+        response = new Response(JSON.stringify({ error: error.message || "An internal error occurred." }), { status: 500, headers: { "Content-Type": "application/json" } });
     }
 
-    let handler;
-    if (url.pathname === "/pre-assess") {
-      handler = handlePreAssessment;
-    } else if (url.pathname === "/check-cache-status") {
-      handler = handleCacheCheck;
-    } else if (url.pathname === "/coach") {
-      handler = handleCoachingFeedback;
-    } else {
-      handler = handleFullAssessment;
-    }
-
-    let response = await handler(request, env);
-
-    if (!(response instanceof Response)) {
-      response = new Response(typeof response === "string" ? response : JSON.stringify(response), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-    }
     const newHeaders = new Headers(response.headers);
     newHeaders.set("Access-Control-Allow-Origin", allowOrigin);
     newHeaders.set("Vary", "Origin");
