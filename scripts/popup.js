@@ -121,7 +121,7 @@ async function loadAndApplyState() {
     assessmentProgressText.textContent = data.assessmentStep || "Running assessment...";
     showState('assessment-loading');
   } else if (pageType === 'meeting' && data.assessmentStatus === 'skills-selection' && data.qualifiedSkills) {
-    renderSkillSelector(data.qualifiedSkills);
+    renderSkillSelector(data.qualifiedSkills); // This now handles the new data structure
     showState('skills-selection');
     if (data.selectedSeller) sellerSelect.value = data.selectedSeller;
     if (data.selectedSkills) {
@@ -162,18 +162,23 @@ function resetState() {
 }
 
 // --- DYNAMIC UI RENDERING ---
-function renderSkillSelector(qualifiedSkills = []) {
+function renderSkillSelector(qualifiedSkills = []) { // qualifiedSkills is now [{skill: "Name", cached: true}, ...]
     competencySkillSelector.innerHTML = '';
     const fragment = document.createDocumentFragment();
+
+    // Create a map for easy lookup of skill name and its cached status
+    const qualifiedSkillMap = new Map(qualifiedSkills.map(item => [item.skill, item.cached]));
+    
     const qualifiedCompetencies = {};
 
     for (const competency in ALL_RUBRICS) {
         for (const skill in ALL_RUBRICS[competency].skills) {
-            if (qualifiedSkills.includes(skill)) {
+            if (qualifiedSkillMap.has(skill)) {
                 if (!qualifiedCompetencies[competency]) {
                     qualifiedCompetencies[competency] = { skills: {} };
                 }
-                qualifiedCompetencies[competency].skills[skill] = {};
+                // Store the cached status along with the skill
+                qualifiedCompetencies[competency].skills[skill] = { cached: qualifiedSkillMap.get(skill) };
             }
         }
     }
@@ -196,7 +201,12 @@ function renderSkillSelector(qualifiedSkills = []) {
             <div class="skills-list pl-8 pt-2 space-y-2">
                 ${Object.keys(qualifiedCompetencies[competency].skills).map(skill => {
                     const skillId = `${competency}|${skill}`;
-                    return `<div class="flex items-center"><input type="checkbox" id="${skillId}" name="skill" value="${skillId}" class="skill-checkbox h-4 w-4 text-indigo-600 border-gray-300 rounded"><label for="${skillId}" class="ml-2 block text-sm text-gray-700">${skill}</label></div>`;
+                    const isCached = qualifiedCompetencies[competency].skills[skill].cached;
+                    const cachedBadge = isCached ? ` <span class="ml-2 text-xs font-medium bg-blue-100 text-blue-800 py-0.5 px-2 rounded-full">Cached</span>` : '';
+                    return `<div class="flex items-center">
+                                <input type="checkbox" id="${skillId}" name="skill" value="${skillId}" class="skill-checkbox h-4 w-4 text-indigo-600 border-gray-300 rounded">
+                                <label for="${skillId}" class="ml-2 block text-sm text-gray-700 flex items-center">${skill}${cachedBadge}</label>
+                            </div>`;
                 }).join('')}
             </div>`;
         fragment.appendChild(details);
@@ -217,17 +227,31 @@ function renderResults(resultData) {
         html += `<div class="bg-white p-4 rounded-lg shadow mt-2"><p class="text-red-500">The model returned an empty assessment. Please try again.</p></div>`;
     } else {
         assessments.forEach(assessment => {
-            const strengthsList = (assessment.strengths || []).map(s => `<li class="text-gray-700">${s}</li>`).join('');
+            const strengthsList = (assessment.strengths || []).map(s => `<li>${s}</li>`).join('');
             const improvementTitle = assessment.improvement_title || "Areas for Improvement";
+            
             const improvementsList = (assessment.improvements || []).map(imp => {
+                let insteadOfLabel = "Instead of:";
+                let tryThisLabel = "Try this:";
+                let insteadOfColor = "text-gray-600";
+                
+                // For top performers, re-label to show how to apply their existing skills
+                if (assessment.rating >= 5) {
+                    insteadOfLabel = "Observed Action:";
+                    tryThisLabel = "Next-Level Application:";
+                    insteadOfColor = "text-blue-600"; // Use a different color to highlight the positive example
+                }
+
                 let exampleHTML = (imp.example && (imp.example.instead_of || imp.example.try_this)) ? `
                     <div class="mt-2 text-sm italic text-gray-500 border-l-4 border-gray-200 pl-3 space-y-2">
-                        <p><strong class="text-gray-600">Instead of:</strong> "${imp.example.instead_of}"</p>
-                        <p><strong class="text-green-600">Try this:</strong> "${imp.example.try_this}"</p>
+                        <p><strong class="${insteadOfColor}">${insteadOfLabel}</strong> "${imp.example.instead_of}"</p>
+                        <p><strong class="text-green-600">${tryThisLabel}</strong> "${imp.example.try_this}"</p>
                     </div>` : '';
+
                 return `<div class="border-t border-gray-200 pt-3 mt-3"><p class="text-gray-800 font-medium">${imp.point || 'General Improvement'}</p>${exampleHTML}</div>`;
             }).join('');
-            const tipsList = (assessment.coaching_tips || []).map(tip => `<li class="text-gray-700">${tip}</li>`).join('');
+
+            const tipsList = (assessment.coaching_tips || []).map(tip => `<li>${tip}</li>`).join('');
             const ratingColor = assessment.rating >= 4 ? 'text-green-600' : assessment.rating >= 3 ? 'text-yellow-600' : 'text-red-600';
 
             html += `
@@ -277,7 +301,6 @@ async function handleAnalyzeSkills() {
     const selectedSeller = sellerSelect.value;
     if (!selectedSeller) { alert("Please select a seller to continue."); return; }
     saveState();
-    showState('skills-loading');
     chrome.runtime.sendMessage({
         action: "startSkillQualification",
         payload: { transcript: transcriptText, allSkills: Object.values(ALL_RUBRICS).flatMap(c => Object.keys(c.skills)), sellerId: selectedSeller }
