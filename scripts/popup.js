@@ -218,6 +218,7 @@ function renderResults(resultData) {
     } else {
         assessments.forEach(assessment => {
             const strengthsList = (assessment.strengths || []).map(s => `<li class="text-gray-700">${s}</li>`).join('');
+            const improvementTitle = assessment.improvement_title || "Areas for Improvement";
             const improvementsList = (assessment.improvements || []).map(imp => {
                 let exampleHTML = (imp.example && (imp.example.instead_of || imp.example.try_this)) ? `
                     <div class="mt-2 text-sm italic text-gray-500 border-l-4 border-gray-200 pl-3 space-y-2">
@@ -236,7 +237,7 @@ function renderResults(resultData) {
                         <p class="text-2xl font-bold ${ratingColor}">${assessment.rating}<span class="text-base font-medium text-gray-500">/5</span></p>
                     </div>
                     <div class="mt-4"><h4 class="font-bold text-sm text-green-700 uppercase tracking-wider pb-1 border-b-2 border-green-200">Strengths Exhibited</h4><ul class="list-disc list-inside text-sm mt-2 space-y-2">${strengthsList || '<li>None identified.</li>'}</ul></div>
-                    <div class="mt-6"><h4 class="font-bold text-sm text-yellow-700 uppercase tracking-wider pb-1 border-b-2 border-yellow-200">Areas for Improvement</h4><div class="text-sm mt-2 space-y-4">${improvementsList || '<p>None identified.</p>'}</div></div>
+                    <div class="mt-6"><h4 class="font-bold text-sm text-yellow-700 uppercase tracking-wider pb-1 border-b-2 border-yellow-200">${improvementTitle}</h4><div class="text-sm mt-2 space-y-4">${improvementsList || '<p>None identified.</p>'}</div></div>
                     <div class="mt-6"><h4 class="font-bold text-sm text-blue-700 uppercase tracking-wider pb-1 border-b-2 border-blue-200">Coaching Tips</h4><ul class="list-disc list-inside text-sm mt-2 space-y-2">${tipsList || '<li>None identified.</li>'}</ul></div>
                 </div>`;
         });
