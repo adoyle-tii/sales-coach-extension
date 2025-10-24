@@ -14,6 +14,8 @@
             width: 32px;
             height: 32px;
             animation: spin 1s linear infinite;
+            margin-right: 16px; /* Adds space between spinner and text */
+            flex-shrink: 0; /* Prevents the spinner from shrinking */
         }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         details > summary { list-style: none; }
@@ -42,7 +44,7 @@
             </div>
 
             <div id="step-2-container" class="hidden">
-                 <div id="skills-loader-container" class="flex flex-col items-center justify-center p-8 space-y-2 hidden">
+                 <div id="skills-loader-container" class="flex items-center p-8 hidden">
                     <div class="loader"></div>
                     <p class="text-sm text-gray-600">Finding relevant skills...</p>
                 </div>
@@ -74,15 +76,15 @@
             </button>
         </div>
         
-        <div id="initial-loader-container" class="flex flex-col items-center justify-center p-8 space-y-2">
+        <div id="initial-loader-container" class="flex items-center p-8">
             <div class="loader"></div>
             <p class="text-sm text-gray-600">Reading page data...</p>
         </div>
-        <div id="final-loader-container" class="flex flex-col items-center justify-center p-8 space-y-2 hidden">
+        <div id="final-loader-container" class="flex items-center p-8 hidden">
             <div class="loader"></div>
             <p id="assessment-progress-text" class="text-sm text-gray-600">Running full assessment...</p>
         </div>
-        <div id="results-container" class="space-y-4">
+        <div id="results-container" class="space-y-2">
             </div>
     </div>
     <script src="scripts/rubric.js"></script>

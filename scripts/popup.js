@@ -120,6 +120,8 @@ async function loadAndApplyState() {
   } else if (data.assessmentStatus === 'assessment-loading') {
     assessmentProgressText.textContent = data.assessmentStep || "Running assessment...";
     showState('assessment-loading');
+  } else if (data.assessmentStatus === 'skills-loading') {
+    showState('skills-loading');
   } else if (pageType === 'meeting' && data.assessmentStatus === 'skills-selection' && data.qualifiedSkills) {
     renderSkillSelector(data.qualifiedSkills); // This now handles the new data structure
     showState('skills-selection');
@@ -300,6 +302,7 @@ function selectAllSkills(state) {
 async function handleAnalyzeSkills() {
     const selectedSeller = sellerSelect.value;
     if (!selectedSeller) { alert("Please select a seller to continue."); return; }
+    showState('skills-loading');
     saveState();
     chrome.runtime.sendMessage({
         action: "startSkillQualification",

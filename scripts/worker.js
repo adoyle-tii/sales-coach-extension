@@ -170,15 +170,20 @@ For EACH characteristic in EACH level of the rubric, you must perform the follow
 2.  **Scan & Identify:** Find ALL potentially relevant quotes from "${sellerName}".
 3.  **Critique & Filter:** Scrutinize the quotes. Do they *directly* and *unambiguously* demonstrate the skill? Discard weak quotes.
 4.  **Synthesize & Justify:** Formulate your 'reason' based on the filtered evidence.
-5.  **Final Determination:** Set 'met' to 'true' or 'false'.
+5.  **Initial Determination:** Tentatively set 'met' to 'true' or 'false'.
+6.  **Sanity Check:** Before finalizing a 'false' determination, ask: 'Is the reason for failure because the seller's performance *exceeded* the criteria?'
+    - If YES, you MUST change the determination to 'met: true' and briefly explain this in your 'reason'.
+    - If NO, keep the 'false' determination.
+7.  **Finalize:** Assemble the final JSON object for the characteristic.
+
 
 After completing this process for every single characteristic, assemble the final JSON object.
 
 **CRITICAL RULE 1:** The example below is for structure only. You MUST NOT use the content from the example in your response. Your analysis must be based entirely on the provided transcript and rubric.
 **CRITICAL RULE 2:** If any of your 'reason' or 'evidence' strings contain double quotes ("), you MUST escape them with a backslash (\\"). For example, "He said \\"great.\\""
-**CRITICAL RULE 3:** You must be consistent. Given the same transcript and rubric, your analysis should produce the same result every time.
-**CRITICAL RULE 4 (For Limitations):** For characteristics with a "polarity" of "limitation" or "negative", your task is to determine if the sellers behaviour is **worse than** this negative behavior. If the seller performed *equal to or better than* the limitation described (i.e., they did not exhibit the negative trait), you MUST set **"met": true**. If the sellers behaviour is **worse than** the negative behavior, you MUST set **"met": false**.
-**CRITICAL RULE 5 (For Positives):** For characteristics with a "polarity" of "positive", your task is to determine if the sellers behaviour is **at least equal to** this behavior. If the seller performed *equal to or better than* the criteria described (i.e., they did demonstrated behaviour at least equal to or better than the criteria), you MUST set **"met": true**. If the sellers behaviour is **worse than** the positive behavior, you MUST set **"met": false**.
+**CRITICAL RULE 3 (Polarity):**
+- For "positive" polarity, 'met: true' means the seller's behavior met or exceeded the standard.
+- For "negative" or "limitation" polarity, 'met: true' means the seller successfully *avoided* the negative behavior.
 
 **JSON OUTPUT EXAMPLE:**
 Your final output MUST follow this exact structure.
@@ -203,7 +208,6 @@ Your final output MUST follow this exact structure.
 \`\`\`
 `;
 }
-
 
 function buildSimplifiedCoachingPrompt(skillName, rating, rubricData, transcript) {
   const nextLevelNumber = rating + 1;
@@ -492,7 +496,8 @@ async function handleJudge(request, env) {
         skillName: resolvedSkill.skillName,
         rating,
         levelChecks,
-        rawJudge: parsedJudge
+        rawJudge: parsedJudge,
+        meta: { kv_hit: false } // Ensures meta object is always present
     };
     return new Response(JSON.stringify(result), { headers });
 }
